@@ -266,6 +266,19 @@ i32 main()
     cache(c);
     transactions(c);
     c.exec("DROP TABLE wire_t");
+    c.ping();
+    t.ok(c.txState() == 'I', "ping");
+
+    /* the server ends the session: ERR_IO, and the connection is dead */
+    pg.Conn *other = pg.connect(u);
+    other.exec("SELECT pg_terminate_backend($1)", c.backendPid());
+    other.close();
+    i64 code = 0;
+    try { c.exec("SELECT 1"); } catch (Error e) { code = e.code; }
+    t.ok((code == pg.ERR_IO || code == pg.state("57P01")) && c.isDead(), "a killed session is ERR_IO and dead");
+    code = 0;
+    try { c.exec("SELECT 1"); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_CLOSED, "a dead connection says closed");
     c.close();
     loop();
     return t.done();

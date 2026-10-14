@@ -16,15 +16,22 @@ pub struct Options
 
 /* The connections of one thread (and one kind: loop coroutines or plain
  * code). A non-blocking socket belongs to the coroutine loop of the
- * thread that opened it, so connections never move between shards and a
- * shard needs no lock: only its own thread touches it. */
+ * thread that opened it, so connections never move between shards. When
+ * every connection is open and some sit idle in another thread, a waiter
+ * ends one of them there (Terminate and shutdown(2), which touch no loop)
+ * and leaves it in that shard's zombies: its own thread closes the fd
+ * the next time it uses the pool. The lock guards idle and zombies. */
 struct Shard
 {
     void *thread;
     bool loop;
+    i64 lock;
     Conn **idle;            /* a stack: the most recently used on top */
-    i64 nidle;
+    i64 nidle;              /* (atomic: other threads read it) */
     i64 cap;
+    Conn **zombies;         /* ended by another thread, to close here */
+    i64 nzombies;
+    i64 zcap;
     i64 waiters;            /* coroutines of this shard waiting for a connection */
     i32 wake[2];            /* a pipe: a byte in it wakes the waiters (loop shards) */
 };
@@ -110,6 +117,61 @@ static Shard *Pool.shard()
     return s;
 }
 
+static void Shard.lock_()
+{
+    while (!atomic.cas(&self.lock, 0, 1)) { }
+}
+
+static void Shard.unlock_()
+{
+    atomic.store(&self.lock, 0);
+}
+
+/* Close the connections another thread ended for this one */
+static void Shard.reap()
+{
+    if (!atomic.load(&self.nzombies)) { return; }
+    self.lock_();
+    Conn **list = self.zombies;
+    i64 n = self.nzombies;
+    self.zombies = null;
+    self.nzombies = 0;
+    self.zcap = 0;
+    self.unlock_();
+    for (i64 i = 0; i < n; i++) { list[i].release_(); }
+    mem.free(list);
+}
+
+/* Some other shard's idle connection ends, so this thread may open one:
+ * false when no shard has one */
+static bool Pool.steal(Shard *mine)
+{
+    i64 n = atomic.load(&self.nshards);
+    for (i64 i = 0; i < n; i++) {
+        Shard *o = self.shards[i];
+        if (o == mine || !atomic.load(&o.nidle)) { continue; }
+        o.lock_();
+        if (!o.nidle) { o.unlock_(); continue; }
+        Conn *c = o.idle[0];        /* the least recently used */
+        for (i64 j = 1; j < o.nidle; j++) { o.idle[j - 1] = o.idle[j]; }
+        atomic.store(&o.nidle, o.nidle - 1);
+        u8 bye[5] = {'X', 0, 0, 0, 4};
+        libc.write(c.s.fd, bye, 5);
+        libc.shutdown(c.s.fd, libc.SHUT_RDWR);
+        c.dead = true;
+        if (o.nzombies == o.zcap) {
+            o.zcap = o.zcap ? o.zcap * 2 : 8;
+            o.zombies = mem.realloc(o.zombies, sizeof(Conn *) * o.zcap);
+        }
+        o.zombies[o.nzombies] = c;
+        atomic.store(&o.nzombies, o.nzombies + 1);
+        o.unlock_();
+        atomic.sub(&self.nopen, 1);
+        return true;
+    }
+    return false;
+}
+
 /* Wake the waiters of s (any thread may call it) */
 static void shardWake(Shard *s)
 {
@@ -179,9 +241,14 @@ pub Conn *Pool.acquire()
     i64 deadline = date.monoMs() + self.acquireMs;
     while (true) {
         if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
+        s.reap();
         i64 now = date.monoMs();
-        while (s.nidle) {
-            Conn *c = s.idle[--s.nidle];
+        while (true) {
+            s.lock_();
+            if (!s.nidle) { s.unlock_(); break; }
+            Conn *c = s.idle[s.nidle - 1];
+            atomic.store(&s.nidle, s.nidle - 1);
+            s.unlock_();
             if (self.usable(c, now)) { return c; }
             self.discard(c);
         }
@@ -199,6 +266,7 @@ pub Conn *Pool.acquire()
             return c;
         }
         atomic.sub(&self.nopen, 1);
+        if (self.steal(s)) { continue; }
         if (date.monoMs() >= deadline) {
             throw(ERR_POOL, "pg: no connection free within %d ms (maxConns %d)", self.acquireMs, self.maxConns);
         }
@@ -222,12 +290,16 @@ static void poolPut(void *pool, Conn *c)
         p.discard(c);
         return;
     }
+    c.idleSince = now;
+    s.lock_();
     if (s.nidle == s.cap) {
         s.cap = s.cap ? s.cap * 2 : 8;
         s.idle = mem.realloc(s.idle, sizeof(Conn *) * s.cap);
     }
-    c.idleSince = now;
-    s.idle[s.nidle++] = c;
+    s.idle[s.nidle] = c;
+    atomic.store(&s.nidle, s.nidle + 1);
+    s.unlock_();
+    s.reap();
     if (atomic.load(&s.waiters)) { shardWake(s); }
 }
 
@@ -344,7 +416,12 @@ pub void Pool.close()
     i64 k = atomic.load(&self.nshards);
     for (i64 i = 0; i < k; i++) {
         Shard *s = self.shards[i];
-        while (s.nidle) { self.discard(s.idle[--s.nidle]); }
+        s.reap();
+        while (s.nidle) {
+            Conn *c = s.idle[s.nidle - 1];
+            atomic.store(&s.nidle, s.nidle - 1);
+            self.discard(c);
+        }
     }
     atomic.add(&self.nopen, -1 << 32);      /* nopen < 0 from now on: discard frees at 0 */
     self.freeIfDone();
@@ -358,6 +435,7 @@ static void Pool.freeIfDone()
     i64 k = atomic.load(&self.nshards);
     for (i64 i = 0; i < k; i++) {
         Shard *s = self.shards[i];
+        s.reap();
         mem.free(s.idle);
         if (s.wake[0] >= 0) { libc.close(s.wake[0]); libc.close(s.wake[1]); }
         mem.free(s);

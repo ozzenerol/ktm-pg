@@ -8,6 +8,8 @@ import atomic, date, libc, net, net.http, str, t, thread;
 const i32 PORT = 58431;
 i64 gOk = 0;
 i64 gServed = 0;
+i64 gNoDial = 0;
+i64 gBad = 0;
 
 void double(http.Writer *w, http.Request *r)
 {
@@ -27,7 +29,7 @@ i64 get(i64 n)
         fd = net.dial("127.0.0.1", PORT);
         if (fd < 0) { date.sleepMs(10); }
     }
-    if (fd < 0) { return -1; }
+    if (fd < 0) { atomic.add(&gNoDial, 1); return -1; }
     ad String req = str.format("GET /double/%d HTTP/1.0\r\n\r\n", n);
     net.send(fd, req);
     ad String resp = str.new();
@@ -41,6 +43,7 @@ i64 get(i64 n)
     i64 at = str.find(resp, "\r\n\r\n");
     i64 v = -1;
     if (at >= 0 && str.startsWith(resp, "HTTP/1.1 200")) { str.toInt(resp[at + 4:], &v); }
+    if (v != 2 * n && atomic.add(&gBad, 1) == 0) { printf("\n  first bad answer for %d: [%s]", n, resp); }
     return v;
 }
 
@@ -85,6 +88,7 @@ i32 main()
     thread.poolStop(tp);
     thread.poolRelease(tp);
     t.ok(r == 0, "the server ran");
+    t.ok(gNoDial == 0, "every request connected");
     t.ok(atomic.load(&gOk) == 200 && atomic.load(&gServed) == 200, "200 answers, all right");
     t.ok(db.openCount() <= 6, "within maxConns");
     t.ok(took < 10000, "in time");

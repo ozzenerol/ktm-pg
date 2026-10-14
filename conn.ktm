@@ -272,7 +272,7 @@ static void Conn.throwServerError()
 {
     ServerError e = serverError(self.msg);
     defer e.message.free();
-    self.drain();
+    try { self.drain(); } catch { }     /* a FATAL error ends the session: its error says why */
     throw(e.code, "%s", e.message);
 }
 
@@ -601,7 +601,16 @@ static Stmt *Conn.prepare(u8[] sql)
     bool failed = false;
     ServerError err;
     while (true) {
-        u8 t = self.recv();
+        u8 t;
+        try {
+            t = self.recv();
+        } catch (Error e) {
+            if (!failed) {
+                self.dropSlot(st, reused);
+                throw(e);
+            }
+            break;                  /* the session ended after its error: throw that */
+        }
         if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
         if (failed) { continue; }
         if (t == 'E') { err = serverError(self.msg); failed = true; }
@@ -615,14 +624,7 @@ static Stmt *Conn.prepare(u8[] sql)
         /* '1' ParseComplete, '3' CloseComplete, 'n' NoData */
     }
     if (failed) {
-        mem.free(st.paramOids);
-        for (i64 i = 0; i < st.ncols; i++) { st.cols[i].name.free(); }
-        mem.free(st.cols);
-        mem.set(st, 0, sizeof(Stmt));
-        if (reused) {               /* the slot is empty now: fill it with the last one */
-            Stmt *last = &self.stmts[--self.nstmts];
-            if (last != st) { *st = *last; mem.set(last, 0, sizeof(Stmt)); }
-        }
+        self.dropSlot(st, reused);
         defer err.message.free();
         throw(err.code, "%s", err.message);
     }
@@ -631,6 +633,19 @@ static Stmt *Conn.prepare(u8[] sql)
     st.lastUse = ++self.clock;
     if (!reused) { self.nstmts++; }
     return st;
+}
+
+/* A statement that failed to prepare: free its slot */
+static void Conn.dropSlot(Stmt *st, bool reused)
+{
+    mem.free(st.paramOids);
+    for (i64 i = 0; i < st.ncols; i++) { st.cols[i].name.free(); }
+    mem.free(st.cols);
+    mem.set(st, 0, sizeof(Stmt));
+    if (reused) {                   /* the slot is empty now: fill it with the last one */
+        Stmt *last = &self.stmts[--self.nstmts];
+        if (last != st) { *st = *last; mem.set(last, 0, sizeof(Stmt)); }
+    }
 }
 
 /* A RowDescription into st.cols */

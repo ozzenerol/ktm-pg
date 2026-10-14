@@ -185,6 +185,42 @@ void threads()
     db.close();
 }
 
+/* Idle connections of another thread don't block this one */
+void hoard(void *priv, void *arg)
+{
+    pg.Pool *db = arg;
+    pg.Conn *a = db.acquire();
+    pg.Conn *b = db.acquire();
+    a.release();
+    b.release();
+}
+
+void stealing()
+{
+    ad String u = t.url();
+    pg.Options o;
+    o.maxConns = 2;
+    o.acquireTimeoutMs = 2000;
+    pg.Pool *db = pg.open(u, &o);
+    thread.Pool *tp = thread.poolNew(1);
+    thread.poolEnqueue(tp, db, &hoard);
+    thread.poolWait(tp);
+    t.ok(db.openCount() == 2 && db.idleCount() == 2, "another thread holds 2 idle");
+    i64 start = date.monoMs();
+    pg.Conn *a = db.acquire();
+    pg.Conn *b = db.acquire();
+    t.ok(date.monoMs() - start < 500 && db.openCount() == 2, "this thread takes over their budget at once");
+    t.ok(pg.queryOne<i64>(a, "SELECT 1") == 1 && pg.queryOne<i64>(b, "SELECT 2") == 2, "and uses them");
+    a.release();
+    b.release();
+    thread.poolEnqueue(tp, db, &hoard);     /* that thread closes what was ended for it */
+    thread.poolWait(tp);
+    thread.poolStop(tp);
+    thread.poolRelease(tp);
+    t.ok(db.openCount() <= 2, "still within maxConns");
+    db.close();
+}
+
 i32 main()
 {
     t.start("pool");
@@ -192,5 +228,6 @@ i32 main()
     limits();
     coroutines();
     threads();
+    stealing();
     return t.done();
 }
