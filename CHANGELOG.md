@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.1 (unreleased)
+## v0.1.1 (2026-10-14)
 
 - A frozen server (`docker pause`, a hung host) no longer holds `Pool.acquire()`: the health
   ping of an idle connection gets at most 1 s and drops the connection without a cancel round,
