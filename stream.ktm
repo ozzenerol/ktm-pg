@@ -103,7 +103,11 @@ static bool Stream.startTls(tls.Context *ctx, u8[] host)
     u8 b[1];
     /* exactly one byte: anything after it would be unencrypted data
      * slipped in before the handshake (CVE-2021-23222) */
-    if (self.read(self, b[0:1]) != 1) {
+    i64 n = self.read(self, b[0:1]);
+    if (n < 0 && os.errno() == libc.ETIMEDOUT) {
+        throw(ERR_CONNECT, "pg: no answer to the TLS request within %d ms", self.timeoutMs);
+    }
+    if (n != 1) {
         throw(ERR_TLS, "pg: the server closed the connection at the TLS request");
     }
     if (b[0] != 'S') { return false; }

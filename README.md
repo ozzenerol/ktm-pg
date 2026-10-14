@@ -54,7 +54,7 @@ What the URL leaves out comes from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `
 
 | Key | Meaning |
 | --- | --- |
-| `connect_timeout` | seconds to connect and log in (0: no limit) |
+| `connect_timeout` | seconds to connect and log in, all of it (0: no limit; a pool's connects then get what is left of `acquireTimeoutMs`) |
 | `sslmode` | `disable`, `allow`, `prefer` (the default), `require`, `verify-ca`, `verify-full` |
 | `sslrootcert` | CAs to trust, a PEM file (`system`: the system's) |
 | `sslcert`, `sslkey`, `sslpassword` | a client certificate, its key and the key's password |
@@ -188,8 +188,8 @@ pg.Conn *c = db.acquire(); ...; c.release();   // a connection to yourself (SET,
 | `maxConns` | 4 per CPU, 8 to 64 |
 | `maxIdleMs` | 30 minutes |
 | `maxLifetimeMs` | 1 hour |
-| `acquireTimeoutMs` | 30 s, then `ERR_POOL` |
-| `healthCheckMs` | a connection idle this long (1 s) is pinged before use |
+| `acquireTimeoutMs` | 30 s, then `ERR_POOL`; it bounds the health ping and connecting too |
+| `healthCheckMs` | a connection idle this long (1 s) is pinged before use; no answer within 1 s and it is dropped |
 | `queryTimeoutMs` | none |
 
 The pool is safe from every thread of `coro.serve` and `net.http`. Each thread has its share of
@@ -259,7 +259,8 @@ c.cancel();                    // from another coroutine or thread
 
 A query past its time is cancelled on the server and throws `pg.QUERY_CANCELED`, and the
 connection stays usable. When the server doesn't answer the cancel within 5 s, the connection
-is closed (`ERR_IO`). `statement_timeout=...` in the URL sets the server's own limit.
+is closed (`ERR_IO`), so on a server that froze every call ends within its limit + 5 s.
+`statement_timeout=...` in the URL sets the server's own limit.
 
 ## TLS
 

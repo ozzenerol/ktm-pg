@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.1 (unreleased)
+
+- A frozen server (`docker pause`, a hung host) no longer holds `Pool.acquire()`: the health
+  ping of an idle connection gets at most 1 s and drops the connection without a cancel round,
+  and a new connection must connect within what is left of `acquireTimeoutMs` (when the URL
+  has no `connect_timeout`). `acquire()` throws `ERR_CONNECT` within its limit.
+- `connect_timeout` bounds the whole connect (dial, TLS request and log-in), not each read.
+- The 5 s a timed-out query gives the server to answer its cancel include the cancel's own
+  connection, so a query ends within its limit + 5 s.
+- Tests: `T_PG_NAME` and `T_PG_PORT` run the suite on other containers; a frozen-server test.
+
 ## v0.1.0 (2026-10-14)
 
 The first release: a PostgreSQL client for ktm, written in ktm, speaking the wire protocol

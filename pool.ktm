@@ -93,6 +93,22 @@ const i64 STARVE_MS = 20;
  * long may be taken whatever the quotas */
 const i64 STEAL_IDLE_MS = 2000;
 
+/* A health check's ping (and a connect) gets at most what is left of
+ * acquireTimeoutMs, and the ping at most this; no answer in time and the
+ * connection is dropped, no cancel round */
+const i64 HEALTH_PING_MS = 1000;
+
+/* ... but never less than this, so a late acquire doesn't drop a healthy connection */
+const i64 MIN_LIMIT_MS = 100;
+
+/* What is left until deadline, capped at most, at least MIN_LIMIT_MS */
+static i64 limitTo(i64 deadline, i64 most)
+{
+    i64 left = deadline - date.monoMs();
+    if (left > most) { left = most; }
+    return left < MIN_LIMIT_MS ? MIN_LIMIT_MS : left;
+}
+
 /* A pool for the server the URL names (see pg.connect). It connects
  * when a connection is first needed, so a wrong URL shows at the first
  * query, not here; db.ping() checks at once. Close it with db.close(). */
@@ -285,19 +301,23 @@ static void Pool.discard(Conn *c)
     self.wakeOne();
 }
 
-/* Whether an idle connection may be handed out: not too old, alive */
-static bool Pool.usable(Conn *c, i64 now)
+/* Whether an idle connection may be handed out: not too old, alive.
+ * The health ping ends by deadline (the acquire's). */
+static bool Pool.usable(Conn *c, i64 now, i64 deadline)
 {
     if (c.dead || !c.quiet()) { return false; }
     if (now - c.born >= self.maxLifetimeMs || now - c.idleSince >= self.maxIdleMs) { return false; }
     if (now - c.idleSince >= self.healthMs) {
-        try { c.ping(); } catch { return false; }
+        c.timeoutMs = limitTo(deadline, HEALTH_PING_MS);
+        c.dropCode = ERR_IO;
+        try { c.ping(); } catch { c.dropCode = 0; return false; }
+        c.dropCode = 0;
     }
     return true;
 }
 
 /* An idle connection of s that is fit to use, or null */
-static Conn *Pool.takeIdle(Shard *s)
+static Conn *Pool.takeIdle(Shard *s, i64 deadline)
 {
     i64 now = date.monoMs();
     while (true) {
@@ -306,14 +326,15 @@ static Conn *Pool.takeIdle(Shard *s)
         Conn *c = s.idle[s.nidle - 1];
         atomic.store(&s.nidle, s.nidle - 1);
         s.unlock_();
-        if (self.usable(c, now)) { return c; }
+        if (self.usable(c, now, deadline)) { return c; }
         self.discard(c);
     }
     return null;
 }
 
-/* A new connection for s, if the budget allows: null if it doesn't */
-static Conn *Pool.openNew(Shard *s)
+/* A new connection for s, if the budget allows: null if it doesn't.
+ * Connecting ends by deadline when the URL sets no connect_timeout. */
+static Conn *Pool.openNew(Shard *s, i64 deadline)
 {
     if (atomic.add(&self.nopen, 1) >= self.maxConns) {
         atomic.sub(&self.nopen, 1);
@@ -322,7 +343,7 @@ static Conn *Pool.openNew(Shard *s)
     atomic.add(&s.nconns, 1);
     Conn *c;
     try {
-        c = connectConfig(&self.cfg);
+        c = connectConfig(&self.cfg, limitTo(deadline, self.acquireMs));
     } catch (Error e) {
         atomic.sub(&s.nconns, 1);
         atomic.sub(&self.nopen, 1);
@@ -394,16 +415,16 @@ static Conn *Pool.take(bool own)
     Shard *s = self.shard();
     s.reap();
     atomic.store(&s.lastUse, date.monoMs());
+    i64 deadline = date.monoMs() + self.acquireMs;
     Conn *c;
     if (!atomic.load(&s.waiters)) {             /* nobody queued: the fast way */
-        c = self.takeIdle(s);
-        if (!c) { c = self.openNew(s); }
+        c = self.takeIdle(s, deadline);
+        if (!c) { c = self.openNew(s, deadline); }
         if (c) {
             c.timeoutMs = self.queryMs;
             return c;
         }
     }
-    i64 deadline = date.monoMs() + self.acquireMs;
     Waiter w;
     w.got = null;
     w.next = null;
@@ -422,7 +443,7 @@ static Conn *Pool.take(bool own)
             w.got = null;
             if (queued) { queued = false; atomic.sub(&self.nwaiting, 1); }
             if (atomic.load(&self.closed)) { self.discard(c); continue; }
-            if (self.usable(c, date.monoMs())) {
+            if (self.usable(c, date.monoMs(), deadline)) {
                 c.timeoutMs = self.queryMs;
                 return c;
             }
@@ -442,9 +463,9 @@ static Conn *Pool.take(bool own)
             }
             if (!queued) {
                 s.reap();
-                c = self.takeIdle(s);
-                if (!c) { c = self.openNew(s); }
-                if (!c && self.steal(s)) { c = self.openNew(s); }
+                c = self.takeIdle(s, deadline);
+                if (!c) { c = self.openNew(s, deadline); }
+                if (!c && self.steal(s)) { c = self.openNew(s, deadline); }
                 if (c) {
                     c.timeoutMs = self.queryMs;
                     return c;
@@ -561,8 +582,9 @@ static Conn *Pool.acquireShared()
     atomic.store(&s.lastUse, date.monoMs());
     Conn *c = null;
     if (!atomic.load(&s.waiters)) {
-        c = self.takeIdle(s);
-        if (!c) { c = self.openNew(s); }
+        i64 deadline = date.monoMs() + self.acquireMs;
+        c = self.takeIdle(s, deadline);
+        if (!c) { c = self.openNew(s, deadline); }
     }
     if (!c && !s.xwaiters) {
         /* join the least busy shared one. A caller that needs a

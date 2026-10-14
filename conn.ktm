@@ -47,6 +47,8 @@ pub struct Conn : Db
     private i64 timeoutMs;      /* per query, 0: none */
     private i64 deadline;       /* date.monoMs() the running query must end by, 0: none */
     private bool cancelSent;
+    private i64 dropCode;       /* while connecting or health-pinging: past the deadline the connection
+                                 * is closed at once with this error, no cancel (0: cancel) */
     private i64 users;          /* pool calls sharing it (pipelining), 0 when one owner has it */
     private bool draining;      /* shared, but takes no new calls: it goes back when they are done */
     private tls.Context *tlsCtx;    /* the TLS context its session uses (a cancel uses it too) */
@@ -279,10 +281,23 @@ static void Conn.fill(i64 n)
  * when that was asked already and nothing came, give the connection up */
 static void Conn.timedOut()
 {
+    if (self.dropCode) {
+        i64 code = self.dropCode;
+        self.dropCode = 0;
+        self.deadline = 0;
+        self.dead = true;
+        self.s.close(&self.s);
+        self.wakeAll();
+        if (code == ERR_CONNECT) {
+            throw(code, "pg: can't connect to %s:%d: no answer within %d ms", self.host, self.port, self.timeoutMs);
+        }
+        throw(code, "pg: the server didn't answer within %d ms: connection closed", self.timeoutMs);
+    }
     if (!self.cancelSent) {
         self.cancelSent = true;
+        i64 asked = date.monoMs();
         self.sendCancel();
-        self.deadline = date.monoMs() + CANCEL_GRACE_MS;
+        self.deadline = asked + CANCEL_GRACE_MS;    /* the cancel's own connection counts */
         return;
     }
     self.deadline = 0;
@@ -493,12 +508,16 @@ pub Conn *connect(u8[] url = "")
     return c;
 }
 
-static Conn *connectConfig(Config *cfg)
+/* limitMs: how long connecting (dial, TLS and start-up together) may
+ * take when the URL sets no connect_timeout (0: no limit) */
+static Conn *connectConfig(Config *cfg, i64 limitMs = 0)
 {
     Conn *c = mem.allocZero(sizeof(Conn));
     c.open = &connOpen;
     c.s.fd = -1;
-    if (!streamDial(&c.s, cfg.host, cfg.port, cfg.connectTimeoutMs)) {
+    i64 limit = cfg.connectTimeoutMs > 0 ? cfg.connectTimeoutMs : limitMs;
+    i64 start = date.monoMs();
+    if (!streamDial(&c.s, cfg.host, cfg.port, limit)) {
         i32 err = os.errno();
         mem.free(c);
         throw(ERR_CONNECT, "pg: can't connect to %s:%d: %s", cfg.host, cfg.port, libc.strerror(err));
@@ -509,8 +528,20 @@ static Conn *connectConfig(Config *cfg)
     c.host = str.from(cfg.host);
     c.port = cfg.port;
     try {
+        if (limit > 0) {
+            /* a server that takes the connection but doesn't answer (frozen,
+             * overloaded) fails it at the deadline */
+            c.timeoutMs = limit;
+            c.deadline = start + limit;
+            c.dropCode = ERR_CONNECT;
+            c.s.timeoutMs = c.leftMs();
+        }
         c.negotiateTls(cfg);
+        if (limit > 0) { c.s.timeoutMs = c.leftMs(); }
         c.startup(cfg);
+        c.timeoutMs = 0;
+        c.deadline = 0;
+        c.dropCode = 0;
     } catch (Error e) {
         c.release_();
         if (e.code == ERR_BOUNDS) { throw(ERR_PROTOCOL, "pg: a malformed message from the server: %s", e.message); }
@@ -519,12 +550,18 @@ static Conn *connectConfig(Config *cfg)
     return c;
 }
 
+/* What is left until the deadline, at least 1 ms */
+static i64 Conn.leftMs()
+{
+    i64 left = self.deadline - date.monoMs();
+    return left > 0 ? left : 1;
+}
+
 /* TLS as sslmode says: disable none; allow and prefer when the server
  * has it; require, verify-ca and verify-full or fail */
 static void Conn.negotiateTls(Config *cfg)
 {
     if (cfg.sslMode == SSL_DISABLE || (cfg.host.len && cfg.host[0] == '/')) { return; }
-    if (cfg.connectTimeoutMs > 0) { self.s.timeoutMs = cfg.connectTimeoutMs; }
     tls.Context *ctx = cfg.tlsContext();
     if (self.s.startTls(ctx, cfg.host)) {
         self.tlsCtx = ctx;
@@ -546,7 +583,6 @@ pub u8[] Conn.tlsVersion()
 
 static void Conn.startup(Config *cfg)
 {
-    if (cfg.connectTimeoutMs > 0) { self.s.timeoutMs = cfg.connectTimeoutMs; }
     self.begin(0);
     self.put32(196608);     /* protocol 3.0 */
     self.putStr("user");

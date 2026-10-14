@@ -129,22 +129,121 @@ void pooled()
     db.close();
 }
 
-/* A server that doesn't answer at all: the connection is given up */
+/* A server that doesn't answer at all (docker pause): every call ends
+ * within its limit, and the connection is given up */
+void freeze()
+{
+    ad String ct = t.container();
+    proc.shellf("docker pause %s >/dev/null", ct);
+}
+
+void thaw()
+{
+    ad String ct = t.container();
+    proc.shellf("docker unpause %s >/dev/null", ct);
+}
+
+i64 pingCode(pg.Conn *c)
+{
+    try { c.ping(); } catch (Error e) {
+        if (t.verbose()) { printf("\n    (%s)", e.message); }
+        return e.code;
+    }
+    return 0;
+}
+
 void frozen()
 {
     ad String u = t.url();
     pg.Conn *c = pg.connect(u);
     c.setQueryTimeout(300);
-    proc.shellf("docker pause ktm-pg-%s >/dev/null", t.version());
+    freeze();
     i64 start = date.monoMs();
     i64 code = codeOf(c, "SELECT 1");
     i64 took = date.monoMs() - start;
-    proc.shellf("docker unpause ktm-pg-%s >/dev/null", t.version());
-    t.ok(code == pg.ERR_IO && c.isDead() && took < 15000, "a frozen server: ERR_IO and a dead connection");
+    thaw();
+    /* the limit, then the cancel's grace: 5 s with the cancel's own connection */
+    t.ok(code == pg.ERR_IO && c.isDead() && took >= 290 && took < 300 + 5000 + 700, "a frozen server: a query ends with ERR_IO in its limit + 5 s");
+    c.close();
+
+    c = pg.connect(u);
+    c.setQueryTimeout(1000);
+    freeze();
+    start = date.monoMs();
+    code = pingCode(c);
+    took = date.monoMs() - start;
+    thaw();
+    t.ok(code == pg.ERR_IO && c.isDead() && took >= 990 && took < 1000 + 5000 + 700, "ping() too");
     c.close();
     pg.Conn *again = pg.connect(u);
     t.ok(pg.queryOne<i64>(again, "SELECT 1") == 1, "the server works again");
     again.close();
+}
+
+pg.Pool *gPool;
+bool gLoop;
+
+/* in the thread or coroutine that uses the pool: connections belong to
+ * the shard of the one that opened them */
+void frozenPoolRun()
+{
+    pg.Pool *db = gPool;
+    u8 *where = gLoop ? "in a coroutine: " : "";
+    t.ok(pg.queryOne<i64>(db, "SELECT 1") == 1 && db.idleCount() == 1, "an idle connection");
+    date.sleepMs(1100);         /* past healthCheckMs: the next acquire pings it */
+    freeze();
+    i64 start = date.monoMs();
+    i64 code = 0;
+    try {
+        pg.Conn *c = db.acquire();
+        c.release();
+    } catch (Error e) {
+        if (t.verbose()) { printf("\n    (%s)", e.message); }
+        code = e.code;
+    }
+    i64 took = date.monoMs() - start;
+    thaw();
+    /* the ping (at most 1 s, no cancel), then a connect in what is left */
+    ad String what = str.format("%sacquire() on a frozen server: ERR_CONNECT within acquireTimeoutMs (%d ms)", where, took);
+    t.ok(code == pg.ERR_CONNECT && took < 2000 + 700, what.cstr());
+    t.ok(db.openCount() == 0, "nothing left open");
+    t.ok(pg.queryOne<i64>(db, "SELECT 2") == 2, "the pool works again");
+
+    /* a connection just used isn't pinged: the query's own limit holds */
+    freeze();
+    start = date.monoMs();
+    code = 0;
+    try { db.ping(); } catch (Error e) { code = e.code; }
+    took = date.monoMs() - start;
+    thaw();
+    t.ok(code == pg.ERR_IO && took < 1000 + 5000 + 700, "db.ping(): queryTimeoutMs + 5 s");
+    t.ok(pg.queryOne<i64>(db, "SELECT 3") == 3, "and again");
+}
+
+void *frozenPoolCo(void *arg)
+{
+    frozenPoolRun();
+    return null;
+}
+
+/* A pool on a frozen server: an idle connection's health ping and a new
+ * connection both end within acquireTimeoutMs */
+void frozenPool(bool loop)
+{
+    ad String u = t.url();
+    pg.Options o;
+    o.maxConns = 2;
+    o.acquireTimeoutMs = 2000;
+    o.queryTimeoutMs = 1000;
+    gPool = pg.open(u, &o);
+    gLoop = loop;
+    if (loop) {
+        coro.go(&frozenPoolCo);
+        coro.run();
+    } else {
+        frozenPoolRun();
+    }
+    gPool.close();
 }
 
 i32 main()
@@ -154,5 +253,7 @@ i32 main()
     coroutines();
     pooled();
     frozen();
+    frozenPool(false);
+    frozenPool(true);
     return t.done();
 }
