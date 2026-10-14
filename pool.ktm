@@ -1,5 +1,5 @@
 module pg;
-import atomic, coro, date, libc, mem, net, reflect;
+import atomic, coro, date, libc, mem, reflect;
 
 extern "c" void *pthread_self();
 
@@ -7,34 +7,51 @@ extern "c" void *pthread_self();
  * default in the comment. */
 pub struct Options
 {
-    i64 maxConns;           /* connections open at once, all threads together (0: max(4, CPUs)) */
+    i64 maxConns;           /* connections open at once, all threads together (0: 4 per CPU, 8 to 64) */
     i64 maxIdleMs;          /* an idle connection is closed after this (0: 30 min) */
     i64 maxLifetimeMs;      /* a connection is closed after this, at its next release (0: 1 hour) */
     i64 acquireTimeoutMs;   /* waiting for a free connection longer throws ERR_POOL (0: 30 s) */
-    i64 healthCheckMs;      /* a connection idle this long is checked before it is handed out (0: 1 s) */
+    i64 healthCheckMs;      /* a connection idle this long is pinged before it is handed out (0: 1 s) */
     i64 queryTimeoutMs;     /* every query's limit, see Conn.setQueryTimeout (0: none) */
 };
 
 /* The connections of one thread (and one kind: loop coroutines or plain
  * code). A non-blocking socket belongs to the coroutine loop of the
- * thread that opened it, so connections never move between shards. When
- * every connection is open and some sit idle in another thread, a waiter
- * ends one of them there (Terminate and shutdown(2), which touch no loop)
- * and leaves it in that shard's zombies: its own thread closes the fd
- * the next time it uses the pool. The lock guards idle and zombies. */
+ * thread that opened it, so connections never move between shards.
+ *
+ * The budget: maxConns for the pool, and each shard's fair share of it,
+ * maxConns / shards, its quota. A shard opens connections while the pool
+ * has budget left. When it hasn't, a shard under its quota takes an idle
+ * connection of a shard over its quota: it ends it there (Terminate and
+ * shutdown(2), which touch no loop) and leaves it in that shard's
+ * zombies, which its own thread closes the next time it uses the pool.
+ * A shard over its quota closes what comes back while others wait.
+ * Inside a shard, waiters queue and a connection given back goes to the
+ * first one, waking it alone (coro.unpark, no system call). */
 struct Shard
 {
     void *thread;
     bool loop;
-    i64 lock;
+    i64 lock;               /* guards idle, zombies and the queue */
     Conn **idle;            /* a stack: the most recently used on top */
     i64 nidle;              /* (atomic: other threads read it) */
     i64 cap;
+    i64 nconns;             /* connections of this shard, idle or in use (atomic) */
+    i64 lastUse;            /* date.monoMs() of its last acquire (atomic) */
     Conn **zombies;         /* ended by another thread, to close here */
     i64 nzombies;
     i64 zcap;
-    i64 waiters;            /* coroutines of this shard waiting for a connection */
-    i32 wake[2];            /* a pipe: a byte in it wakes the waiters (loop shards) */
+    i64 waiters;            /* how many wait in the queue (atomic) */
+    Waiter *qhead;
+    Waiter *qtail;
+};
+
+/* A coroutine (or thread) waiting for a connection */
+struct Waiter
+{
+    Conn *got;              /* handed over by poolPut */
+    Waiter *next;
+    coro.Coroutine *co;     /* parked in its loop (null for a plain thread: it polls) */
 };
 
 /* A pool of connections, safe to share between the threads of
@@ -60,6 +77,10 @@ pub struct Pool : Db
 
 const i64 MAX_SHARDS = 1024;
 
+/* The idle connections of a thread that hasn't used the pool for this
+ * long may be taken whatever the quotas */
+const i64 STEAL_IDLE_MS = 2000;
+
 /* A pool for the server the URL names (see pg.connect). It connects
  * when a connection is first needed, so a wrong URL shows at the first
  * query, not here; db.ping() checks at once. Close it with db.close(). */
@@ -75,7 +96,10 @@ pub Pool *open(u8[] url = "", Options *opts = null)
 #ifdef IS_MACOS
     cpus = libc.sysconf(58);
 #endif
-    p.maxConns = o.maxConns > 0 ? o.maxConns : (cpus > 4 ? cpus : 4);
+    i64 dflt = 4 * cpus;
+    if (dflt < 8) { dflt = 8; }
+    if (dflt > 64) { dflt = 64; }
+    p.maxConns = o.maxConns > 0 ? o.maxConns : dflt;
     p.maxIdleMs = o.maxIdleMs > 0 ? o.maxIdleMs : 30 * 60 * 1000;
     p.maxLifetimeMs = o.maxLifetimeMs > 0 ? o.maxLifetimeMs : 60 * 60 * 1000;
     p.acquireMs = o.acquireTimeoutMs > 0 ? o.acquireTimeoutMs : 30000;
@@ -97,10 +121,6 @@ static Shard *Pool.shard()
     }
     while (!atomic.cas(&self.lock, 0, 1)) { }
     n = atomic.load(&self.nshards);
-    for (i64 i = 0; i < n; i++) {        /* only this thread adds its own, but look again anyway */
-        Shard *s = self.shards[i];
-        if (s.thread == th && s.loop == loop) { atomic.store(&self.lock, 0); return s; }
-    }
     if (n == MAX_SHARDS) {
         atomic.store(&self.lock, 0);
         throw(ERR_POOL, "pg: a pool used from more than %d threads", MAX_SHARDS);
@@ -108,16 +128,18 @@ static Shard *Pool.shard()
     Shard *s = mem.allocZero(sizeof(Shard));
     s.thread = th;
     s.loop = loop;
-    s.wake[0] = -1;
-    s.wake[1] = -1;
-    if (loop && libc.pipe(s.wake) == 0) {
-        net.setNonBlocking(s.wake[0]);
-        net.setNonBlocking(s.wake[1]);
-    }
     self.shards[n] = s;
     atomic.store(&self.nshards, n + 1);
     atomic.store(&self.lock, 0);
     return s;
+}
+
+/* A shard's fair share of maxConns */
+static i64 Pool.quota()
+{
+    i64 n = atomic.load(&self.nshards);
+    i64 q = self.maxConns / (n ? n : 1);
+    return q ? q : 1;
 }
 
 static void Shard.lock_()
@@ -138,69 +160,111 @@ static void Shard.reap()
     Conn **list = self.zombies;
     i64 n = self.nzombies;
     self.zombies = null;
-    self.nzombies = 0;
     self.zcap = 0;
+    atomic.store(&self.nzombies, 0);
     self.unlock_();
     for (i64 i = 0; i < n; i++) { list[i].release_(); }
     mem.free(list);
 }
 
-/* Some other shard's idle connection ends, so this thread may open one:
- * false when no shard has one */
-static bool Pool.steal(Shard *mine)
+/* ---- waiting ---- */
+
+/* Wake w: unpark its coroutine when it is of this thread's loop; a
+ * waiter of another thread finds out at its next look (it parks briefly) */
+static void Shard.wakeWaiter(Waiter *w)
 {
-    i64 n = atomic.load(&self.nshards);
-    for (i64 i = 0; i < n; i++) {
-        Shard *o = self.shards[i];
-        if (o == mine || !atomic.load(&o.nidle)) { continue; }
-        o.lock_();
-        if (!o.nidle) { o.unlock_(); continue; }
-        Conn *c = o.idle[0];        /* the least recently used */
-        for (i64 j = 1; j < o.nidle; j++) { o.idle[j - 1] = o.idle[j]; }
-        atomic.store(&o.nidle, o.nidle - 1);
-        u8 bye[5] = {'X', 0, 0, 0, 4};
-        libc.write(c.s.fd, bye, 5);
-        libc.shutdown(c.s.fd, libc.SHUT_RDWR);
-        c.dead = true;
-        if (o.nzombies == o.zcap) {
-            o.zcap = o.zcap ? o.zcap * 2 : 8;
-            o.zombies = mem.realloc(o.zombies, sizeof(Conn *) * o.zcap);
-        }
-        o.zombies[o.nzombies] = c;
-        atomic.store(&o.nzombies, o.nzombies + 1);
-        o.unlock_();
-        atomic.sub(&self.nopen, 1);
-        return true;
+    if (w.co && self.thread == pthread_self() && coro.inLoop()) { coro.unpark(w.co); }
+}
+
+static void Shard.enqueue(Waiter *w, bool front)
+{
+    self.lock_();
+    if (front) {
+        w.next = self.qhead;
+        self.qhead = w;
+        if (!self.qtail) { self.qtail = w; }
+    } else {
+        w.next = null;
+        if (self.qtail) { self.qtail.next = w; } else { self.qhead = w; }
+        self.qtail = w;
     }
+    atomic.add(&self.waiters, 1);
+    self.unlock_();
+}
+
+/* Take w off the queue; false when it wasn't on it */
+static bool Shard.dequeue(Waiter *w)
+{
+    self.lock_();
+    Waiter *prev = null;
+    for (Waiter *q = self.qhead; q; q = q.next) {
+        if (q == w) {
+            if (prev) { prev.next = q.next; } else { self.qhead = q.next; }
+            if (self.qtail == q) { self.qtail = prev; }
+            atomic.sub(&self.waiters, 1);
+            self.unlock_();
+            return true;
+        }
+        prev = q;
+    }
+    self.unlock_();
     return false;
 }
 
-/* Wake the waiters of s (any thread may call it) */
-static void shardWake(Shard *s)
+/* The first waiter, off the queue (null if none); the lock is held */
+static Waiter *Shard.popLocked()
 {
-    if (s.wake[1] >= 0) {
-        u8 b = 1;
-        libc.write(s.wake[1], &b, 1);
-    }
+    Waiter *w = self.qhead;
+    if (!w) { return null; }
+    self.qhead = w.next;
+    if (!self.qhead) { self.qtail = null; }
+    atomic.sub(&self.waiters, 1);
+    return w;
 }
 
-/* A connection's budget is free again: wake a shard that waits for one */
+/* Budget came free: wake the first waiter of a shard under its quota
+ * (or of any shard), so it opens a connection */
 static void Pool.wakeOne()
 {
     if (!atomic.load(&self.nwaiting)) { return; }
+    i64 q = self.quota();
     i64 n = atomic.load(&self.nshards);
+    Shard *any = null;
     for (i64 i = 0; i < n; i++) {
         Shard *s = self.shards[i];
-        if (atomic.load(&s.waiters) > 0) { shardWake(s); return; }
+        if (!atomic.load(&s.waiters)) { continue; }
+        if (atomic.load(&s.nconns) < q) { any = s; break; }
+        if (!any) { any = s; }
+    }
+    if (!any) { return; }
+    any.lock_();
+    if (any.qhead) { any.wakeWaiter(any.qhead); }
+    any.unlock_();
+}
+
+/* Pause until woken, a moment passes, or the deadline. A moment: 5 ms,
+ * so budget freed by another thread (which can't wake us) is seen soon. */
+static void Pool.wait(Waiter *w, i64 deadline)
+{
+    i64 left = deadline - date.monoMs();
+    if (left <= 0) { return; }
+    if (w.co) {
+        coro.park(left > 5 ? 5 : left);
+    } else {
+        date.sleepMs(1);
     }
 }
+
+/* ---- taking and giving back ---- */
 
 /* Close a connection of the pool for good */
 static void Pool.discard(Conn *c)
 {
+    Shard *s = c.shard;
     c.pool = null;
     c.terminate();
     c.release_();
+    atomic.sub(&s.nconns, 1);
     atomic.sub(&self.nopen, 1);
     if (atomic.load(&self.closed)) { self.freeIfDone(); return; }
     self.wakeOne();
@@ -209,7 +273,7 @@ static void Pool.discard(Conn *c)
 /* Whether an idle connection may be handed out: not too old, alive */
 static bool Pool.usable(Conn *c, i64 now)
 {
-    if (c.dead) { return false; }
+    if (c.dead || !c.quiet()) { return false; }
     if (now - c.born >= self.maxLifetimeMs || now - c.idleSince >= self.maxIdleMs) { return false; }
     if (now - c.idleSince >= self.healthMs) {
         try { c.ping(); } catch { return false; }
@@ -217,69 +281,172 @@ static bool Pool.usable(Conn *c, i64 now)
     return true;
 }
 
-/* Wait until a connection may be free, or the deadline */
-static void Pool.wait(Shard *s, i64 deadline)
+/* An idle connection of s that is fit to use, or null */
+static Conn *Pool.takeIdle(Shard *s)
 {
-    i64 left = deadline - date.monoMs();
-    if (left <= 0) { return; }
-    atomic.add(&s.waiters, 1);
-    atomic.add(&self.nwaiting, 1);
-    if (s.loop && s.wake[0] >= 0) {
-        coro.wait(s.wake[0], libc.POLLIN, left > 50 ? 50 : left);
-        u8 buf[64];
-        while (libc.read(s.wake[0], buf, 64) > 0) { }
-    } else {
-        date.sleepMs(1);
+    i64 now = date.monoMs();
+    while (true) {
+        s.lock_();
+        if (!s.nidle) { s.unlock_(); return null; }
+        Conn *c = s.idle[s.nidle - 1];
+        atomic.store(&s.nidle, s.nidle - 1);
+        s.unlock_();
+        if (self.usable(c, now)) { return c; }
+        self.discard(c);
     }
-    atomic.sub(&s.waiters, 1);
-    atomic.sub(&self.nwaiting, 1);
+    return null;
+}
+
+/* A new connection for s, if the budget allows: null if it doesn't */
+static Conn *Pool.openNew(Shard *s)
+{
+    if (atomic.add(&self.nopen, 1) >= self.maxConns) {
+        atomic.sub(&self.nopen, 1);
+        return null;
+    }
+    atomic.add(&s.nconns, 1);
+    Conn *c;
+    try {
+        c = connectConfig(&self.cfg);
+    } catch (Error e) {
+        atomic.sub(&s.nconns, 1);
+        atomic.sub(&self.nopen, 1);
+        self.wakeOne();
+        throw(e);
+    }
+    c.pool = self;
+    c.shard = s;
+    return c;
+}
+
+/* End an idle connection of another shard so mine may open one: when
+ * mine is under its quota and the other over its own, or when the other
+ * thread hasn't used the pool for STEAL_IDLE_MS. false when there is
+ * none. */
+static bool Pool.steal(Shard *mine)
+{
+    i64 q = self.quota();
+    i64 n = atomic.load(&self.nshards);
+    for (i64 i = 0; i < n; i++) {
+        Shard *o = self.shards[i];
+        i64 on = atomic.load(&o.nconns);
+        if (o == mine || !atomic.load(&o.nidle)) { continue; }
+        i64 have = atomic.load(&mine.nconns);
+        bool fair = have < q && on > q;
+        o.lock_();
+        if (!o.nidle) { o.unlock_(); continue; }
+        Conn *c = o.idle[0];        /* the least recently used */
+        if (!fair && date.monoMs() - atomic.load(&o.lastUse) < STEAL_IDLE_MS) { o.unlock_(); continue; }
+        for (i64 j = 1; j < o.nidle; j++) { o.idle[j - 1] = o.idle[j]; }
+        atomic.store(&o.nidle, o.nidle - 1);
+        u8 bye[5] = {'X', 0, 0, 0, 4};
+        libc.write(c.s.fd, bye, 5);
+        libc.shutdown(c.s.fd, libc.SHUT_RDWR);
+        c.dead = true;
+        c.pool = null;
+        if (o.nzombies == o.zcap) {
+            o.zcap = o.zcap ? o.zcap * 2 : 8;
+            o.zombies = mem.realloc(o.zombies, sizeof(Conn *) * o.zcap);
+        }
+        o.zombies[o.nzombies] = c;
+        atomic.store(&o.nzombies, o.nzombies + 1);
+        o.unlock_();
+        atomic.sub(&o.nconns, 1);
+        atomic.sub(&self.nopen, 1);
+        return true;
+    }
+    return false;
 }
 
 /* A connection of the pool, all yours until c.release() (or c.close())
  * gives it back. Throws ERR_POOL when none is free within
- * acquireTimeoutMs, and what connecting throws. */
+ * acquireTimeoutMs, and what connecting throws. Waiters are served in
+ * the order they came. */
 pub Conn *Pool.acquire()
 {
+    if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
     Shard *s = self.shard();
+    s.reap();
+    atomic.store(&s.lastUse, date.monoMs());
+    Conn *c;
+    if (!atomic.load(&s.waiters)) {             /* nobody queued: the fast way */
+        c = self.takeIdle(s);
+        if (!c) { c = self.openNew(s); }
+        if (c) {
+            c.timeoutMs = self.queryMs;
+            return c;
+        }
+    }
     i64 deadline = date.monoMs() + self.acquireMs;
+    Waiter w;
+    w.got = null;
+    w.next = null;
+    w.co = s.loop ? coro.current() : null;
+    bool queued = false;
+    bool first = false;
+    defer { if (queued) { s.dequeue(&w); atomic.sub(&self.nwaiting, 1); } }
     while (true) {
-        if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
-        s.reap();
-        i64 now = date.monoMs();
-        while (true) {
-            s.lock_();
-            if (!s.nidle) { s.unlock_(); break; }
-            Conn *c = s.idle[s.nidle - 1];
-            atomic.store(&s.nidle, s.nidle - 1);
-            s.unlock_();
-            if (self.usable(c, now)) {
+        if (w.got) {                /* handed over by poolPut, which took us off the queue */
+            c = w.got;
+            w.got = null;
+            if (queued) { queued = false; atomic.sub(&self.nwaiting, 1); }
+            if (atomic.load(&self.closed)) { self.discard(c); continue; }
+            if (self.usable(c, date.monoMs())) {
                 c.timeoutMs = self.queryMs;
                 return c;
             }
             self.discard(c);
+            continue;
         }
-        if (atomic.add(&self.nopen, 1) < self.maxConns) {
-            Conn *c;
-            try {
-                c = connectConfig(&self.cfg);
-            } catch (Error e) {
-                atomic.sub(&self.nopen, 1);
-                self.wakeOne();
-                throw(e);
+        if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
+        if (!queued || s.qhead == &w) {
+            /* off the queue while we try: a ping or a connect pauses this
+             * coroutine, and poolPut must not hand us a second connection */
+            if (queued) {
+                if (s.dequeue(&w)) {
+                    queued = false;
+                    atomic.sub(&self.nwaiting, 1);
+                }
+                if (w.got) { continue; }
             }
-            c.pool = self;
-            c.shard = s;
-            c.timeoutMs = self.queryMs;
-            return c;
+            if (!queued) {
+                s.reap();
+                c = self.takeIdle(s);
+                if (!c) { c = self.openNew(s); }
+                if (!c && self.steal(s)) { c = self.openNew(s); }
+                if (c) {
+                    c.timeoutMs = self.queryMs;
+                    return c;
+                }
+            }
         }
-        atomic.sub(&self.nopen, 1);
-        if (self.steal(s)) { continue; }
         if (date.monoMs() >= deadline) {
             throw(ERR_POOL, "pg: no connection free within %d ms (maxConns %d)", self.acquireMs, self.maxConns);
         }
-        self.wait(s, deadline);
+        if (!queued) {
+            s.enqueue(&w, first);
+            atomic.add(&self.nwaiting, 1);
+            queued = true;
+            first = true;           /* from now on it keeps its place */
+        }
+        self.wait(&w, deadline);
     }
     return null;
+}
+
+/* Whether s should close a connection coming back, for another shard:
+ * s is over its quota and a waiting shard is under its own. Never
+ * between shards at their quota, so a steady load reconnects nothing. */
+static bool Pool.giveUp(Shard *s)
+{
+    i64 q = self.quota();
+    if (atomic.load(&s.nconns) <= q) { return false; }
+    i64 n = atomic.load(&self.nshards);
+    for (i64 i = 0; i < n; i++) {
+        Shard *o = self.shards[i];
+        if (o != s && atomic.load(&o.waiters) && atomic.load(&o.nconns) < q) { return true; }
+    }
+    return false;
 }
 
 /* c comes back to its pool */
@@ -292,12 +459,21 @@ static void poolPut(void *pool, Conn *c)
         p.discard(c);
         return;
     }
-    if (atomic.load(&s.waiters) == 0 && atomic.load(&p.nwaiting) > 0) {
-        /* others wait, in other threads: free the budget for them */
-        p.discard(c);
+    c.idleSince = now;
+    if (atomic.load(&s.waiters)) {  /* the first waiter gets it */
+        s.lock_();
+        Waiter *w = s.popLocked();
+        s.unlock_();
+        if (w) {
+            w.got = c;
+            s.wakeWaiter(w);
+            return;
+        }
+    }
+    if (atomic.load(&p.nwaiting) && p.giveUp(s)) {
+        p.discard(c);               /* over our share while others wait */
         return;
     }
-    c.idleSince = now;
     s.lock_();
     if (s.nidle == s.cap) {
         s.cap = s.cap ? s.cap * 2 : 8;
@@ -307,7 +483,6 @@ static void poolPut(void *pool, Conn *c)
     atomic.store(&s.nidle, s.nidle + 1);
     s.unlock_();
     s.reap();
-    if (atomic.load(&s.waiters)) { shardWake(s); }
 }
 
 /* Gives a connection from Pool.acquire back (the same as c.close()) */
@@ -424,9 +599,12 @@ pub void Pool.close()
     for (i64 i = 0; i < k; i++) {
         Shard *s = self.shards[i];
         s.reap();
-        while (s.nidle) {
+        while (true) {
+            s.lock_();
+            if (!s.nidle) { s.unlock_(); break; }
             Conn *c = s.idle[s.nidle - 1];
             atomic.store(&s.nidle, s.nidle - 1);
+            s.unlock_();
             self.discard(c);
         }
     }
@@ -444,7 +622,6 @@ static void Pool.freeIfDone()
         Shard *s = self.shards[i];
         s.reap();
         mem.free(s.idle);
-        if (s.wake[0] >= 0) { libc.close(s.wake[0]); libc.close(s.wake[1]); }
         mem.free(s);
     }
     mem.free(self.shards);

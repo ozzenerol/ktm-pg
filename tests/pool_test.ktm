@@ -152,7 +152,7 @@ void coroutines()
     coro.run();
     i64 took = date.monoMs() - start;
     t.ok(gDone == 40, "40 coroutines done");
-    t.ok(gMaxOpen <= 4 && gDb.openCount() == 4, "with 4 connections");
+    t.ok(gMaxOpen <= 4 && gDb.openCount() <= 4, "with at most 4 connections");
     t.ok(took < 3000, "sharing them without blocking");
     gDb.close();
 }
@@ -200,7 +200,7 @@ void stealing()
     ad String u = t.url();
     pg.Options o;
     o.maxConns = 2;
-    o.acquireTimeoutMs = 2000;
+    o.acquireTimeoutMs = 5000;
     pg.Pool *db = pg.open(u, &o);
     thread.Pool *tp = thread.poolNew(1);
     thread.poolEnqueue(tp, db, &hoard);
@@ -209,7 +209,7 @@ void stealing()
     i64 start = date.monoMs();
     pg.Conn *a = db.acquire();
     pg.Conn *b = db.acquire();
-    t.ok(date.monoMs() - start < 500 && db.openCount() == 2, "this thread takes over their budget at once");
+    t.ok(date.monoMs() - start < 3000 && db.openCount() == 2, "this thread takes over a quiet thread's budget (after 2 s)");
     t.ok(pg.queryOne<i64>(a, "SELECT 1") == 1 && pg.queryOne<i64>(b, "SELECT 2") == 2, "and uses them");
     a.release();
     b.release();

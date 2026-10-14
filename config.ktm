@@ -13,6 +13,14 @@ struct Config
     i64 connectTimeoutMs;
     bool sslSet;                /* the URL said sslmode */
     vec.Vec<String> params;     /* runtime parameters: key, value, key, value ... */
+    /* SCRAM's keys for the last salt and iteration count: a pool's
+     * reconnects skip the PBKDF2 (thousands of HMACs). Guarded by
+     * scramLock, as a pool's threads share the Config. */
+    i64 scramLock;
+    String scramSalt;
+    i64 scramIter;
+    u8 clientKey[32];
+    u8 serverKey[32];
 };
 
 static void Config.free()
@@ -21,6 +29,7 @@ static void Config.free()
     self.user.free();
     self.password.free();
     self.database.free();
+    self.scramSalt.free();
     self.params.free();         /* and its Strings */
 }
 

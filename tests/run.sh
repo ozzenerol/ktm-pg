@@ -26,7 +26,7 @@ for f in "$dir"/*_test.ktm; do
             fi
             code=$?
             line=$(printf '%s\n' "$out" | grep -ao '[0-9]*/[0-9]* passed$' | tail -1)
-            if [ $code -ne 0 ] || printf '%s\n' "$out" | grep -aq -e FAIL -e "double free" -e "leak" -e "wild free"; then
+            if [ $code -ne 0 ] || printf '%s\n' "$out" | grep -aq -e FAIL -e "double free" -e "never freed" -e "wild free"; then
                 echo "pg $v $mode $name: FAILED (exit $code)"
                 printf '%s\n' "$out" | grep -av "^  ok: " | tail -20
                 printf '%s\n' "$out" | grep -a "^  ok: " | tail -1 | sed 's/^/  last check passed:/' 

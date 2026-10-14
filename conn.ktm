@@ -1,5 +1,5 @@
 module pg;
-import coro, date, hash, libc, mem, os, reflect, str;
+import atomic, coro, date, hash, libc, mem, os, reflect, str;
 
 /* What a Conn, a Tx and a Pool have in common: pg.queryAll and
  * pg.queryOne take any of them as a Db * */
@@ -548,15 +548,32 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
     ad String salt = str.new();
     if (!base64Decode(s, &salt)) { throw(ERR_AUTH, "pg: a bad SCRAM salt"); }
     u8 salted[32], clientKey[32], storedKey[32], sig[32], serverKey[32];
-    pbkdf2Sha256(cfg.password, salt, iter, salted[0:32]);
-    hmacSha256(salted[0:32], "Client Key", clientKey[0:32]);
+    bool cached = false;
+    while (!atomic.cas(&cfg.scramLock, 0, 1)) { }
+    if (cfg.scramIter == iter && cfg.scramSalt.equals(salt)) {
+        mem.copy(clientKey, cfg.clientKey, 32);
+        mem.copy(serverKey, cfg.serverKey, 32);
+        cached = true;
+    }
+    atomic.store(&cfg.scramLock, 0);
+    if (!cached) {
+        pbkdf2Sha256(cfg.password, salt, iter, salted[0:32]);
+        hmacSha256(salted[0:32], "Client Key", clientKey[0:32]);
+        hmacSha256(salted[0:32], "Server Key", serverKey[0:32]);
+        while (!atomic.cas(&cfg.scramLock, 0, 1)) { }
+        cfg.scramSalt.free();
+        cfg.scramSalt = str.from(salt);
+        cfg.scramIter = iter;
+        mem.copy(cfg.clientKey, clientKey, 32);
+        mem.copy(cfg.serverKey, serverKey, 32);
+        atomic.store(&cfg.scramLock, 0);
+    }
     hash.sha256(clientKey[0:32], storedKey[0:32]);
     ad String finalBare = str.format("c=biws,r=%s", r);
     ad String authMsg = str.format("%s,%s,%s", sc.clientFirstBare, serverFirst, finalBare);
     hmacSha256(storedKey[0:32], authMsg, sig[0:32]);
     u8 proof[32];
     for (i64 i = 0; i < 32; i++) { proof[i] = clientKey[i] ^ sig[i]; }
-    hmacSha256(salted[0:32], "Server Key", serverKey[0:32]);
     hmacSha256(serverKey[0:32], authMsg, sc.serverSig[0:32]);
     ad String msg = str.from(finalBare);
     msg.append(",p=");
@@ -604,6 +621,21 @@ static void Conn.terminate()
 pub u8[] Conn.serverVersion()
 {
     return self.version;
+}
+
+/* An idle connection has nothing to read: one that has (the server's
+ * FATAL error before it hung up, or the end of the stream) is broken,
+ * though no query found out yet. One poll(2), no waiting. */
+static bool Conn.quiet()
+{
+    if (self.inEnd > self.inStart) { return false; }
+    libc.pollfd p;
+    p.fd = self.s.fd;
+    p.events = libc.POLLIN;
+    p.revents = 0;
+    if (libc.poll(&p, 1, 0) == 0) { return true; }
+    self.dead = true;
+    return false;
 }
 
 /* Whether the connection is broken (it can only be closed then) */
