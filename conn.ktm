@@ -51,6 +51,8 @@ pub struct Conn : Db
     private bool draining;      /* shared, but takes no new calls: it goes back when they are done */
     private tls.Context *tlsCtx;    /* the TLS context its session uses (a cancel uses it too) */
     private tls.Context *ownCtx;    /* the same, when this connection frees it (pg.connect) */
+    private void *thread;           /* the thread using it (pthread_self) */
+    private bool everLoop;          /* used in a coroutine loop: it stays with that thread */
     private Note *noteHead;         /* notifications not read yet */
     private Note *noteTail;
 };
@@ -461,6 +463,8 @@ static Conn *connectConfig(Config *cfg)
         throw(ERR_CONNECT, "pg: can't connect to %s:%d: %s", cfg.host, cfg.port, libc.strerror(err));
     }
     c.born = date.monoMs();
+    c.thread = pthread_self();
+    c.everLoop = c.s.loop;
     c.host = str.from(cfg.host);
     c.port = cfg.port;
     try {
@@ -821,7 +825,20 @@ static void Conn.wakeAll()
 static void Conn.join(Req *r)
 {
     if (self.dead) { throw(ERR_CLOSED, "pg: the connection is closed"); }
+    void *th = pthread_self();
+    if (th != self.thread) {
+        /* a socket of a coroutine loop belongs to its thread's loop; and two
+         * threads at once would mix their messages */
+        if (self.everLoop) {
+            throw(ERR_CLOSED, "pg: this connection belongs to another thread's coroutine loop: use a pg.Pool to share connections between threads");
+        }
+        if (self.qhead) {
+            throw(ERR_CLOSED, "pg: this connection is in use by another thread: use a pg.Pool to share connections between threads");
+        }
+        self.thread = th;
+    }
     bool loop = coro.inLoop();
+    if (loop) { self.everLoop = true; }
     r.co = loop ? coro.current() : null;
     r.next = null;
     for (Req *q = self.qhead; q; q = q.next) {

@@ -64,8 +64,10 @@ What the URL leaves out comes from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `
 libpq does.
 
 A connection is used by one coroutine at a time, or shared by the coroutines of one thread's
-loop (their queries are pipelined, see below). It belongs to the thread that uses it first:
-share connections between threads through a `pg.Pool`.
+loop (their queries are pipelined, see below). Plain threads may take turns with a connection;
+one that has been used in a coroutine loop stays with that loop's thread, and another thread
+gets `ERR_CLOSED` (as does a second thread while the first one is using it). Share connections
+between threads through a `pg.Pool`.
 
 ## Running statements
 

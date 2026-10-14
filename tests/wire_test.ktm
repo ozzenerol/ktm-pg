@@ -1,5 +1,5 @@
 import "github.com/ozzenerol/ktm-pg";
-import coro, cstr, date, libc, reflect, str, t;
+import coro, cstr, date, libc, reflect, str, t, thread;
 
 /* The wire protocol: start-up, every auth method, simple and extended
  * queries, errors, the statement cache, and coroutines */
@@ -227,6 +227,46 @@ void transactions(pg.Conn *c)
     c.exec("DROP TABLE wire_tx");
 }
 
+/* A connection and threads: plain threads may take turns with one; one
+ * used in a coroutine loop stays with its thread */
+i64 gThreadCode;
+pg.Conn *gShared;
+
+void useIt(void *priv, void *arg)
+{
+    gThreadCode = 0;
+    try {
+        if (pg.queryOne<i64>(gShared, "SELECT 5") != 5) { gThreadCode = -1; }
+    } catch (Error e) {
+        gThreadCode = e.code;
+    }
+}
+
+void *inLoop(void *arg)
+{
+    pg.queryOne<i64>(gShared, "SELECT 6");
+    return null;
+}
+
+void threads()
+{
+    ad String u = t.url();
+    gShared = pg.connect(u);
+    thread.Pool *tp = thread.poolNew(1);
+    thread.poolEnqueue(tp, null, &useIt);
+    thread.poolWait(tp);
+    t.ok(gThreadCode == 0, "another plain thread may use a connection, in turn");
+    t.ok(pg.queryOne<i64>(gShared, "SELECT 7") == 7, "and this one again after it");
+    coro.go(&inLoop);
+    coro.run();
+    thread.poolEnqueue(tp, null, &useIt);
+    thread.poolWait(tp);
+    t.ok(gThreadCode == pg.ERR_CLOSED, "once used in a loop, another thread gets ERR_CLOSED");
+    thread.poolStop(tp);
+    thread.poolRelease(tp);
+    gShared.close();
+}
+
 /* Coroutines: each sleeps on its own connection; together they take as
  * long as one, so the waits don't block the loop's thread */
 i64 gDone = 0;
@@ -280,6 +320,7 @@ i32 main()
     try { c.exec("SELECT 1"); } catch (Error e) { code = e.code; }
     t.ok(code == pg.ERR_CLOSED, "a dead connection says closed");
     c.close();
+    threads();
     loop();
     return t.done();
 }
