@@ -17,6 +17,7 @@ pub struct Rows
     private u8 *fmt;            /* 48 bytes per column: text() of a binary value */
     private i32 *fieldOf;       /* scan: per column, the field it fills (-1: none) */
     private reflect.Type *scanType;
+    private bool own;           /* the connection goes back to its pool when the rows end */
 };
 
 static void Rows.finish()
@@ -24,6 +25,10 @@ static void Rows.finish()
     self.done = true;
     self.row = false;
     self.c.busy = false;
+    if (self.own) {
+        self.own = false;
+        self.c.close();
+    }
 }
 
 /* The next row: true when there is one. Throws the server's error when
@@ -63,9 +68,11 @@ pub bool Rows.next()
             return false;
         }
         if (t == 'E') {
+            ServerError e = serverError(c.msg);
+            defer e.message.free();
+            try { c.drain(); } catch { }
             self.finish();
-            c.busy = false;
-            c.throwServerError();
+            throw(e.code, "%s", e.message);
         }
         /* '2' BindComplete, 'n' NoData, 's' PortalSuspended, 'I' EmptyQueryResponse */
     }

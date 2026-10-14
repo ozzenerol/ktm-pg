@@ -398,8 +398,8 @@ static i64 formatUuid(u8[] b, u8 *buf)
 static i64 binInt(u8[] b)
 {
     if (b.len == 8) { return (i64)bytesBe64(b); }
-    if (b.len == 4) { return sx32(bytesBe32(b)); }
-    if (b.len == 2) { return sx16((u16)b[0] << 8 | b[1]); }
+    if (b.len == 4) { return (i32)bytesBe32(b); }
+    if (b.len == 2) { return (i16)((u16)b[0] << 8 | b[1]); }
     if (b.len == 1) { return b[0]; }
     return 0;
 }
@@ -429,7 +429,7 @@ static bool Rows.value(i64 i, u8[] *b, Column **col)
 static i64 binMicros(u32 oid, u8[] b)
 {
     if (oid == DATE) {
-        i64 d = sx32(bytesBe32(b));
+        i64 d = (i32)bytesBe32(b);
         if (d == I32_MAX) { return I64_MAX; }
         if (d == I32_MIN) { return I64_MIN; }
         return (d + PG_EPOCH_DAYS) * DAY_US;

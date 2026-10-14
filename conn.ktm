@@ -221,30 +221,16 @@ static u8[] cstrAt(u8[] b, i64 at)
     return b[at:i];
 }
 
-/* Sign-extend through a variable: a (i32) cast of a u32 doesn't (ktm
- * rc/0.20.0, reported) */
-static i64 sx32(u32 v)
-{
-    i32 x = v;
-    return x;
-}
-
-static i64 sx16(u16 v)
-{
-    i16 x = v;
-    return x;
-}
-
 static i64 be32At(u8[] b, i64 at)
 {
     if (at + 4 > b.len) { throw(ERR_PROTOCOL, "pg: a message too short"); }
-    return sx32((u32)b.ptr[at] << 24 | (u32)b.ptr[at + 1] << 16 | (u32)b.ptr[at + 2] << 8 | b.ptr[at + 3]);
+    return (i32)((u32)b.ptr[at] << 24 | (u32)b.ptr[at + 1] << 16 | (u32)b.ptr[at + 2] << 8 | b.ptr[at + 3]);
 }
 
 static i64 be16At(u8[] b, i64 at)
 {
     if (at + 2 > b.len) { throw(ERR_PROTOCOL, "pg: a message too short"); }
-    return sx16((u16)b.ptr[at] << 8 | b.ptr[at + 1]);
+    return (i16)((u16)b.ptr[at] << 8 | b.ptr[at + 1]);
 }
 
 /* An ErrorResponse's fields as an error: its SQLSTATE as the code and a
