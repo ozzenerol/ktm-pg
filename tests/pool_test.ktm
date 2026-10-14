@@ -1,5 +1,5 @@
 import "github.com/ozzenerol/ktm-pg";
-import atomic, coro, date, json, reflect, t, thread, vec;
+import atomic, coro, date, json, libc, reflect, t, thread, vec;
 
 /* The pool: reuse, limits, waits, broken connections, coroutines and threads */
 
@@ -221,9 +221,29 @@ void stealing()
     db.close();
 }
 
+/* a null pool: an error that says so, not a crash */
+void nullPool()
+{
+    pg.Pool *db = null;
+    i64 code = 0;
+    bool said = false;
+    try { pg.queryOne<i64>(db, "SELECT 1"); } catch (Error e) {
+        code = e.code;
+        said = libc.strstr(e.message, "on a null pool") != null;
+    }
+    t.ok(code == pg.ERR_ARG && said, "queryOne on a null pool");
+    code = 0;
+    try { pg.queryAll<i64>(db, "SELECT 1"); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_ARG, "queryAll on a null pool");
+    code = 0;
+    try { db.exec("SELECT 1"); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_ARG, "exec on a null pool");
+}
+
 i32 main()
 {
     t.start("pool");
+    nullPool();
     basics();
     limits();
     coroutines();
