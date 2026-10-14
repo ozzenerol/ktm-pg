@@ -35,14 +35,15 @@ void auth()
     t.ok(tryConnect("postgres://postgres:ktm@127.0.0.1:1/x") == pg.ERR_CONNECT, "refused port is ERR_CONNECT");
     ad String ssl = t.url("postgres", "ktm", "?sslmode=require");
     t.ok(tryConnect(ssl) == 0, "sslmode=require connects (the test servers have TLS)");
-    ad String nodb = str.format("postgres://postgres:ktm@127.0.0.1:554%s/no_such_db", t.version());
+    ad String pt = t.port();
+    ad String nodb = str.format("postgres://postgres:ktm@127.0.0.1:%s/no_such_db", pt);
     t.ok(tryConnect(nodb) == pg.state("3D000"), "unknown database is 3D000");
     t.ok(tryConnect("mysql://x") == pg.ERR_CONNECT, "other scheme is ERR_CONNECT");
 }
 
 void env()
 {
-    ad String port = str.format("554%s", t.version());
+    ad String port = t.port();
     libc.setenv("PGHOST", "127.0.0.1", 1);
     libc.setenv("PGPORT", port.cstr(), 1);
     libc.setenv("PGUSER", "ktm_md5", 1);

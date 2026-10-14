@@ -23,9 +23,10 @@ i32 main()
                  "CREATE USER \"ktm odd\" PASSWORD 'p@ss:w/rd%?&='; END IF; END $$");
     c.close();
 
-    ad String odd = str.format("postgres://ktm%%20odd:p%%40ss%%3Aw%%2Frd%%25%%3F%%26%%3D@127.0.0.1:554%s/ktm_test", t.version());
+    ad String pt = t.port();
+    ad String odd = str.format("postgres://ktm%%20odd:p%%40ss%%3Aw%%2Frd%%25%%3F%%26%%3D@127.0.0.1:%s/ktm_test", pt);
     t.ok(tryConnect(odd) == 0, "escaped user and password");
-    ad String v6 = str.format("postgresql://postgres:ktm@[::1]:554%s/ktm_test", t.version());
+    ad String v6 = str.format("postgresql://postgres:ktm@[::1]:%s/ktm_test", pt);
     i64 code = tryConnect(v6);
     t.ok(code == 0 || code == pg.ERR_CONNECT, "an IPv6 host parses");
     t.ok(tryConnect("postgres://postgres:ktm@127.0.0.1:99999/x") == pg.ERR_CONNECT, "a bad port");

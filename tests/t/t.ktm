@@ -2,7 +2,7 @@ module t;
 import cstr, libc, os, str;
 
 /* The test helpers: a check counter and the URL of the server under test
- * (PGVER, default 17: port 554<PGVER>) */
+ * (PGVER, default 17; T_PG_NAME and T_PG_PORT for other containers) */
 
 i64 gChecks = 0;
 i64 gFailed = 0;
@@ -51,11 +51,31 @@ pub u8[] version()
     return cstr.view(v);
 }
 
+u8[] envOr(u8 *name, u8[] dflt)
+{
+    u8 *v = libc.getenv(name);
+    if (!v || !v[0]) { return dflt; }
+    return cstr.view(v);
+}
+
+/* The server's container: <T_PG_NAME>-<PGVER> (default ktm-pg-17) */
+pub String container()
+{
+    return str.format("%s-%s", envOr("T_PG_NAME", "ktm-pg"), version());
+}
+
+/* The server's port: <T_PG_PORT><PGVER> (default 55417) */
+pub String port()
+{
+    return str.format("%s%s", envOr("T_PG_PORT", "554"), version());
+}
+
 /* The URL for user and password (or none) on the test server, database ktm_test */
 pub String url(u8[] user = "postgres", u8[] password = "ktm", u8[] extra = "")
 {
     String u = str.format("postgres://%s", user);
     if (password.len) { u.appendFormat(":%s", password); }
-    u.appendFormat("@127.0.0.1:554%s/ktm_test%s", version(), extra);
+    ad String p = port();
+    u.appendFormat("@127.0.0.1:%s/ktm_test%s", p, extra);
     return u;
 }

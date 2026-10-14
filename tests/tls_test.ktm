@@ -27,7 +27,8 @@ String url(u8[] user, u8[] password, u8[] query, u8[] host = "127.0.0.1")
 {
     String u = str.format("postgres://%s", user);
     if (password.len) { u.appendFormat(":%s", password); }
-    u.appendFormat("@%s:554%s/ktm_test?%s", host, t.version(), query);
+    ad String pt = t.port();
+    u.appendFormat("@%s:%s/ktm_test?%s", host, pt, query);
     return u;
 }
 

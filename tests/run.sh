@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs every tests/*_test.ktm, AOT and JIT (-Memsafe), against each Postgres
 # version: 14 15 16 17 18 (PGVER=17 tests/run.sh for one). Starts the
-# containers with pg-up.sh. Exit code 1 when anything failed.
+# containers with pg-up.sh (T_PG_NAME and T_PG_PORT: other containers, see
+# there). Exit code 1 when anything failed.
 dir=$(cd "$(dirname "$0")" && pwd)
 versions=${PGVER:-"14 15 16 17 18"}
 PGVER="$versions" "$dir/pg-up.sh" || exit 1
@@ -20,7 +21,7 @@ for f in "$dir"/*_test.ktm; do
     for v in $versions; do
         for mode in aot jit; do
             total=$((total + 1))
-            docker unpause ktm-pg-$v >/dev/null 2>&1    # a test that died while it had paused the server
+            docker unpause ${T_PG_NAME:-ktm-pg}-$v >/dev/null 2>&1    # a test that died while it had paused the server
             if [ $mode = aot ]; then
                 out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 "$work/$name" 2>&1)
             else
