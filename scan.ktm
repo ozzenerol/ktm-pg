@@ -184,7 +184,7 @@ static void Rows.scanValue(reflect.Value v, i64 i, i64 flags)
  * db is a Conn *, a Tx * or a Pool *. */
 pub vec.Vec<T> queryAll<T>(Db *db, u8[] sql, any ...args)
 {
-    ad Rows r = db.open(db, sql, args);
+    ad Rows r = db.open(db, sql, args, true);
     return rowsAll<T>(&r);
 }
 
@@ -213,7 +213,7 @@ static vec.Vec<T> rowsAll<T>(Rows *r)
  *   User u = pg.queryOne<User>(db, "SELECT * FROM users WHERE id = $1", 7); */
 pub T queryOne<T>(Db *db, u8[] sql, any ...args)
 {
-    ad Rows r = db.open(db, sql, args);
+    ad Rows r = db.open(db, sql, args, true);
     return rowsOne<T>(&r);
 }
 

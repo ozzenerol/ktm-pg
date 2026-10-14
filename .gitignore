@@ -4,3 +4,6 @@
 *.dylib
 .ktmlib
 a.out
+core
+tests/core
+tests/crash-*.txt

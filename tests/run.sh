@@ -9,6 +9,7 @@ PGVER="$versions" "$dir/pg-up.sh" || exit 1
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 ulimit -v 4000000
+ulimit -c unlimited 2>/dev/null
 fail=0
 total=0
 for f in "$dir"/*_test.ktm; do
@@ -20,16 +21,22 @@ for f in "$dir"/*_test.ktm; do
         for mode in aot jit; do
             total=$((total + 1))
             if [ $mode = aot ]; then
-                out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 "$work/$name" 2>&1)
+                out=$(cd "$work" && PGVER=$v T_VERBOSE=1 timeout 120 "$work/$name" 2>&1)
             else
-                out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 ktm -jit -Memsafe "$f" 2>&1)
+                out=$(cd "$work" && PGVER=$v T_VERBOSE=1 timeout 120 ktm -jit -Memsafe "$f" 2>&1)
             fi
             code=$?
             line=$(printf '%s\n' "$out" | grep -ao '[0-9]*/[0-9]* passed$' | tail -1)
             if [ $code -ne 0 ] || printf '%s\n' "$out" | grep -aq -e FAIL -e "double free" -e "never freed" -e "wild free"; then
                 echo "pg $v $mode $name: FAILED (exit $code)"
                 printf '%s\n' "$out" | grep -av "^  ok: " | tail -20
-                printf '%s\n' "$out" | grep -a "^  ok: " | tail -1 | sed 's/^/  last check passed:/' 
+                printf '%s\n' "$out" | grep -a "^  ok: " | tail -1 | sed 's/^/  last check passed:/'
+                if [ $code -eq 139 ] && [ -f "$dir/core" ] && command -v gdb >/dev/null; then
+                    bin="$work/$name"; [ $mode = jit ] && bin=$(command -v ktm)
+                    gdb -batch -ex bt "$bin" "$dir/core" 2>/dev/null | grep -a "^#" | head -25 > "$dir/crash-$name-pg$v-$mode.txt"
+                    echo "  backtrace: tests/crash-$name-pg$v-$mode.txt"
+                    rm -f "$dir/core"
+                fi
                 fail=$((fail + 1))
             else
                 echo "pg $v $mode $name: $line"

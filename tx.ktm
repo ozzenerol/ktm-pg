@@ -16,11 +16,14 @@ pub struct Tx : Db
  * CommandComplete tag is want */
 static bool Conn.simpleTag(u8[] sql, u8[] want)
 {
-    self.ready();
+    Req r;
+    self.join(&r);
+    defer self.leave(&r);
     self.begin('Q');
     self.putStr(sql);
     self.end();
     self.flush();
+    self.turn(&r);
     bool same = false;
     while (true) {
         u8 t = self.recv();
@@ -88,14 +91,14 @@ pub void Tx.rollback()
     if (self.done) { return; }
     if (!self.c.dead) {
         try {
-            if (self.c.busy) { throw(ERR_CLOSED, "pg: rollback with open rows"); }
+            if (self.c.inUse()) { throw(ERR_CLOSED, "pg: rollback with open rows"); }
             self.c.simpleTag("ROLLBACK", "ROLLBACK");
         } catch { }
     }
     self.end_();
 }
 
-static Rows txOpen(Db *db, u8[] sql, reflect.Value[] args)
+static Rows txOpen(Db *db, u8[] sql, reflect.Value[] args, bool shared)
 {
     Tx *tx = db;
     return tx.conn_().queryArgs(sql, args);

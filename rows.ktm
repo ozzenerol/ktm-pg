@@ -18,13 +18,20 @@ pub struct Rows
     private i32 *fieldOf;       /* scan: per column, the field it fills (-1: none) */
     private reflect.Type *scanType;
     private bool own;           /* the connection goes back to its pool when the rows end */
+    private Req *req;           /* its place in the connection's queue, until the rows end */
+    private bool started;       /* its turn came: it reads */
 };
 
 static void Rows.finish()
 {
     self.done = true;
     self.row = false;
-    self.c.busy = false;
+    if (self.req) {
+        self.c.leave(self.req);
+        mem.free(self.req);
+        self.req = null;
+        self.st.refs--;
+    }
     if (self.own) {
         self.own = false;
         self.c.close();
@@ -37,6 +44,15 @@ pub bool Rows.next()
 {
     if (self.done) { return false; }
     Conn *c = self.c;
+    if (!self.started) {
+        self.started = true;
+        try {
+            c.turn(self.req);
+        } catch (Error e) {
+            self.finish();
+            throw(e);
+        }
+    }
     while (true) {
         u8 t;
         try {

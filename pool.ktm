@@ -38,6 +38,10 @@ struct Shard
     i64 cap;
     i64 nconns;             /* connections of this shard, idle or in use (atomic) */
     i64 lastUse;            /* date.monoMs() of its last acquire (atomic) */
+    i64 xwaiters;           /* waiters that need a connection to themselves (own thread only) */
+    Conn **shared;          /* connections in shared use (own thread only) */
+    i64 nshared;
+    i64 sharedCap;
     Conn **zombies;         /* ended by another thread, to close here */
     i64 nzombies;
     i64 zcap;
@@ -76,6 +80,13 @@ pub struct Pool : Db
 };
 
 const i64 MAX_SHARDS = 1024;
+
+/* At most this many calls share one connection */
+const i64 PIPE_MAX = 64;
+
+/* A thread with no connection may take another's only one when that
+ * thread hasn't used the pool for this long */
+const i64 STARVE_MS = 20;
 
 /* The idle connections of a thread that hasn't used the pool for this
  * long may be taken whatever the quotas */
@@ -332,7 +343,10 @@ static bool Pool.steal(Shard *mine)
         i64 on = atomic.load(&o.nconns);
         if (o == mine || !atomic.load(&o.nidle)) { continue; }
         i64 have = atomic.load(&mine.nconns);
+        /* fair: mine is under its quota and the other over its own, or mine
+         * has none and the other has more than one, or one quiet for a moment */
         bool fair = have < q && on > q;
+        if (!have && (on > 1 || date.monoMs() - atomic.load(&o.lastUse) >= STARVE_MS)) { fair = true; }
         o.lock_();
         if (!o.nidle) { o.unlock_(); continue; }
         Conn *c = o.idle[0];        /* the least recently used */
@@ -364,6 +378,14 @@ static bool Pool.steal(Shard *mine)
  * the order they came. */
 pub Conn *Pool.acquire()
 {
+    return self.take(true);
+}
+
+/* acquire(); own: the caller needs the connection to itself (a
+ * transaction, Rows, acquire()), so shared calls stop joining busy
+ * connections while it waits */
+static Conn *Pool.take(bool own)
+{
     if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
     Shard *s = self.shard();
     s.reap();
@@ -384,7 +406,11 @@ pub Conn *Pool.acquire()
     w.co = s.loop ? coro.current() : null;
     bool queued = false;
     bool first = false;
-    defer { if (queued) { s.dequeue(&w); atomic.sub(&self.nwaiting, 1); } }
+    if (own) { s.xwaiters++; }
+    defer {
+        if (queued) { s.dequeue(&w); atomic.sub(&self.nwaiting, 1); }
+        if (own) { s.xwaiters--; }
+    }
     while (true) {
         if (w.got) {                /* handed over by poolPut, which took us off the queue */
             c = w.got;
@@ -434,17 +460,20 @@ pub Conn *Pool.acquire()
     return null;
 }
 
-/* Whether s should close a connection coming back, for another shard:
- * s is over its quota and a waiting shard is under its own. Never
- * between shards at their quota, so a steady load reconnects nothing. */
+/* Whether s should close a connection coming back, for another shard
+ * that waits: s is over its quota and that one under its own, or that
+ * one has two fewer. Never between shards one apart, so a steady load
+ * settles and reconnects nothing. */
 static bool Pool.giveUp(Shard *s)
 {
     i64 q = self.quota();
-    if (atomic.load(&s.nconns) <= q) { return false; }
+    i64 mine = atomic.load(&s.nconns);
     i64 n = atomic.load(&self.nshards);
     for (i64 i = 0; i < n; i++) {
         Shard *o = self.shards[i];
-        if (o != s && atomic.load(&o.waiters) && atomic.load(&o.nconns) < q) { return true; }
+        if (o == s || !atomic.load(&o.waiters)) { continue; }
+        i64 theirs = atomic.load(&o.nconns);
+        if ((mine > q && theirs < q) || theirs + 1 < mine) { return true; }
     }
     return false;
 }
@@ -455,7 +484,7 @@ static void poolPut(void *pool, Conn *c)
     Pool *p = pool;
     Shard *s = c.shard;
     i64 now = date.monoMs();
-    if (c.dead || c.busy || c.txStatus != 'I' || atomic.load(&p.closed) || now - c.born >= p.maxLifetimeMs) {
+    if (c.dead || c.inUse() || c.txStatus != 'I' || atomic.load(&p.closed) || now - c.born >= p.maxLifetimeMs) {
         p.discard(c);
         return;
     }
@@ -494,11 +523,14 @@ pub void Conn.release()
 /* Checks the connection works: a round trip to the server */
 pub void Conn.ping()
 {
-    self.ready();
+    Req r;
+    self.join(&r);
+    defer self.leave(&r);
     self.begin('Q');
     self.put8(0);
     self.end();
     self.flush();
+    self.turn(&r);
     while (true) {
         u8 t = self.recv();
         if (t == 'E') { self.throwServerError(); }
@@ -514,10 +546,80 @@ pub void Pool.ping()
     c.ping();
 }
 
-static Rows poolOpen(Db *db, u8[] sql, reflect.Value[] args)
+/* A connection for one call whose answer is read at once (exec,
+ * queryAll, queryOne): an idle one, a new one while the budget allows,
+ * else the least busy one of this thread's shared connections, the call
+ * pipelined behind the others. Plain threads and pools with a query
+ * timeout (a cancel would hit the wrong query) don't share. */
+static Conn *Pool.acquireShared()
+{
+    if (self.queryMs || !coro.inLoop()) { return self.take(false); }
+    if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
+    Shard *s = self.shard();
+    s.reap();
+    atomic.store(&s.lastUse, date.monoMs());
+    Conn *c = null;
+    if (!atomic.load(&s.waiters)) {
+        c = self.takeIdle(s);
+        if (!c) { c = self.openNew(s); }
+    }
+    if (!c && !s.xwaiters) {
+        /* join the least busy shared one. A caller that needs a
+         * connection of its own waits: then they must come free, and so
+         * must one of ours when another thread has two fewer. */
+        Conn *best = null;
+        i64 live = 0;
+        for (i64 i = 0; i < s.nshared; i++) {
+            Conn *x = s.shared[i];
+            if (x.dead || x.txStatus != 'I' || x.draining) { continue; }
+            live++;
+            if (!best || x.users < best.users) { best = x; }
+        }
+        if (best && live >= 2 && self.giveUp(s)) {
+            best.draining = true;
+            Conn *next = null;
+            for (i64 i = 0; i < s.nshared; i++) {
+                Conn *x = s.shared[i];
+                if (x.dead || x.txStatus != 'I' || x.draining) { continue; }
+                if (!next || x.users < next.users) { next = x; }
+            }
+            best = next;
+        }
+        if (best && best.users < PIPE_MAX) {
+            best.users++;
+            return best;
+        }
+    }
+    if (!c) { c = self.take(false); }
+    c.timeoutMs = 0;
+    c.users = 1;
+    c.draining = false;
+    if (s.nshared == s.sharedCap) {
+        s.sharedCap = s.sharedCap ? s.sharedCap * 2 : 8;
+        s.shared = mem.realloc(s.shared, sizeof(Conn *) * s.sharedCap);
+    }
+    s.shared[s.nshared++] = c;
+    return c;
+}
+
+/* A sharing call is done with c */
+static void poolUnshare(void *pool, Conn *c)
+{
+    if (--c.users) { return; }
+    Shard *s = c.shard;
+    for (i64 i = 0; i < s.nshared; i++) {
+        if (s.shared[i] == c) {
+            s.shared[i] = s.shared[--s.nshared];
+            break;
+        }
+    }
+    poolPut(pool, c);
+}
+
+static Rows poolOpen(Db *db, u8[] sql, reflect.Value[] args, bool shared)
 {
     Pool *p = db;
-    Conn *c = p.acquire();
+    Conn *c = shared ? p.acquireShared() : p.take(true);
     Rows r;
     try {
         r = c.queryArgs(sql, args);
@@ -531,7 +633,7 @@ static Rows poolOpen(Db *db, u8[] sql, reflect.Value[] args)
 
 pub i64 Pool.execArgs(u8[] sql, reflect.Value[] args)
 {
-    Conn *c = self.acquire();
+    Conn *c = self.acquireShared();
     defer c.release();
     return c.execArgs(sql, args);
 }
@@ -552,12 +654,12 @@ pub i64 Pool.execScript(u8[] sql)
 /* A query on a connection of the pool: the Rows keep it until rows.free() */
 pub Rows Pool.queryArgs(u8[] sql, reflect.Value[] args)
 {
-    return poolOpen(self, sql, args);
+    return poolOpen(self, sql, args, false);
 }
 
 pub Rows Pool.query(u8[] sql, any ...args)
 {
-    return poolOpen(self, sql, args);
+    return poolOpen(self, sql, args, false);
 }
 
 /* A transaction on a connection of the pool: it keeps it until commit()
@@ -622,6 +724,7 @@ static void Pool.freeIfDone()
         Shard *s = self.shards[i];
         s.reap();
         mem.free(s.idle);
+        mem.free(s.shared);
         mem.free(s);
     }
     mem.free(self.shards);

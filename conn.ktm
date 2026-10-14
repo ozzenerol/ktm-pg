@@ -5,7 +5,7 @@ import atomic, coro, date, hash, libc, mem, os, reflect, str;
  * pg.queryOne take any of them as a Db * */
 pub struct Db
 {
-    private fn(Db *, u8[], reflect.Value[]) Rows open;
+    private fn(Db *, u8[], reflect.Value[], bool) Rows open;   /* bool: the rows are read at once (may share a connection) */
 };
 
 /* A connection to the server. One coroutine uses it at a time; share
@@ -27,9 +27,14 @@ pub struct Conn : Db
     private i32 secret;
     private u8 txStatus;        /* 'I' idle, 'T' in a transaction, 'E' in a failed one */
     private bool dead;
-    private bool busy;          /* Rows are open on it */
-    private Stmt *stmts;        /* the statement cache */
+    private Req *qhead;         /* requests in flight, in the order of their answers */
+    private Req *qtail;
+    private u8 *spare;          /* the buffer flush() sends from, while others append to out */
+    private i64 spareCap;
+    private bool flushing;
+    private Stmt **stmts;       /* the statement cache (pointers: a Stmt never moves) */
     private i64 nstmts;
+    private i64 stmtsCap;
     private i64 stmtSeq;        /* the next statement's name: ktm_<n> */
     private i64 clock;          /* use count, for the least recently used statement */
     private String version;     /* server_version */
@@ -42,11 +47,25 @@ pub struct Conn : Db
     private i64 timeoutMs;      /* per query, 0: none */
     private i64 deadline;       /* date.monoMs() the running query must end by, 0: none */
     private bool cancelSent;
+    private i64 users;          /* pool calls sharing it (pipelining), 0 when one owner has it */
+    private bool draining;      /* shared, but takes no new calls: it goes back when they are done */
+};
+
+/* A request on the connection: its messages are sent, and its answer
+ * comes in turn. Coroutines of one loop may share a connection: each
+ * appends its messages and sends them at once (pipelining), and only the
+ * first request reads; when it is done, it wakes the next. */
+struct Req
+{
+    coro.Coroutine *co;         /* null outside a loop coroutine */
+    Req *next;
 };
 
 /* A prepared statement of the cache */
 struct Stmt
 {
+    bool pending;               /* its Parse is in flight */
+    i64 refs;                   /* requests using it: it isn't evicted meanwhile */
     String sql;
     u64 hash;
     u8 name[24];
@@ -143,16 +162,44 @@ static void Conn.broken(u8 *what)
     i32 err = os.errno();
     self.dead = true;
     self.s.close(&self.s);
+    self.wakeAll();
     throw(ERR_IO, "pg: connection lost while %s: %s", what, libc.strerror(err));
 }
 
+/* Send what is in out. Another coroutine may append while a write
+ * waits: the flusher sends from its own buffer and loops until out is
+ * empty, and an append during a flush is sent by that flusher. */
 static void Conn.flush()
 {
     if (self.dead) { throw(ERR_CLOSED, "pg: the connection is closed"); }
-    if (!self.outLen) { return; }
-    bool ok = self.s.write(&self.s, self.out[0:self.outLen]);
-    self.outLen = 0;
-    if (!ok) { self.broken("sending"); }
+    if (self.flushing || !self.outLen) { return; }
+    self.flushing = true;
+    while (self.outLen) {
+        u8 *buf = self.out;
+        i64 n = self.outLen;
+        i64 cap = self.outCap;
+        self.out = self.spare;
+        self.outCap = self.spareCap;
+        self.outLen = 0;
+        self.spare = null;
+        self.spareCap = 0;
+        bool ok;
+        try {
+            ok = self.s.write(&self.s, buf[0:n]);
+        } catch (Error e) {
+            self.spare = buf;
+            self.spareCap = cap;
+            self.flushing = false;
+            throw(e);
+        }
+        self.spare = buf;
+        self.spareCap = cap;
+        if (!ok) {
+            self.flushing = false;
+            self.broken("sending");
+        }
+    }
+    self.flushing = false;
 }
 
 /* ---- reading messages ---- */
@@ -590,8 +637,12 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
 static void Conn.release_()
 {
     self.s.close(&self.s);
-    for (i64 i = 0; i < self.nstmts; i++) { stmtFree(&self.stmts[i]); }
+    for (i64 i = 0; i < self.nstmts; i++) {
+        stmtFree(self.stmts[i]);
+        mem.free(self.stmts[i]);
+    }
     mem.free(self.stmts);
+    mem.free(self.spare);
     mem.free(self.in);
     mem.free(self.out);
     self.version.free();
@@ -603,7 +654,10 @@ static void Conn.release_()
  * goes back to it instead (c.release() says so better). */
 pub void Conn.close()
 {
-    if (self.pool) { poolPut(self.pool, self); return; }
+    if (self.pool) {
+        if (self.users) { poolUnshare(self.pool, self); } else { poolPut(self.pool, self); }
+        return;
+    }
     self.terminate();
     self.release_();
 }
@@ -611,6 +665,7 @@ pub void Conn.close()
 static void Conn.terminate()
 {
     if (self.dead) { return; }
+    if (!self.qhead) { self.s.setLoop(coro.inLoop()); }    /* closed from main() after coro.run() */
     self.outLen = 0;
     self.begin('X');
     self.end();
@@ -666,46 +721,141 @@ static void stmtFree(Stmt *st)
     mem.free(st.cols);
 }
 
-static void Conn.ready()
+/* ---- the request queue ---- */
+
+/* Every coroutine waiting on the connection finds out it broke */
+static void Conn.wakeAll()
+{
+    coro.Coroutine *me = coro.inLoop() ? coro.current() : null;
+    for (Req *q = self.qhead; q; q = q.next) {
+        if (q.co && q.co != me) { coro.unpark(q.co); }
+    }
+}
+
+/* r joins the queue: its messages may be appended now */
+static void Conn.join(Req *r)
 {
     if (self.dead) { throw(ERR_CLOSED, "pg: the connection is closed"); }
-    if (self.busy) { throw(ERR_CLOSED, "pg: the connection still has open rows: free them first"); }
-    self.s.setLoop(coro.inLoop());
+    bool loop = coro.inLoop();
+    r.co = loop ? coro.current() : null;
+    r.next = null;
+    for (Req *q = self.qhead; q; q = q.next) {
+        if (q.co == r.co) {
+            throw(ERR_CLOSED, "pg: the connection still has open rows of this coroutine: free them first");
+        }
+    }
+    if (!self.qhead) { self.s.setLoop(loop); }
+    if (self.qtail) { self.qtail.next = r; } else { self.qhead = r; }
+    self.qtail = r;
+}
+
+/* Wait until r is first: its answer is next */
+static void Conn.turn(Req *r)
+{
+    while (self.qhead != r) {
+        if (self.dead) { throw(ERR_IO, "pg: the connection broke while a query waited for its turn"); }
+        coro.park();
+    }
+    if (self.dead) { throw(ERR_CLOSED, "pg: the connection is closed"); }
     self.cancelSent = false;
     self.deadline = self.timeoutMs ? date.monoMs() + self.timeoutMs : 0;
     self.s.timeoutMs = -1;          /* fill() sets it while there is a deadline */
 }
 
-/* The cached statement for sql, parsed and described on first use */
-static Stmt *Conn.prepare(u8[] sql)
+/* r leaves the queue (done, or given up); the next one is woken */
+static void Conn.leave(Req *r)
+{
+    Req *prev = null;
+    for (Req *q = self.qhead; q; q = q.next) {
+        if (q == r) {
+            if (prev) { prev.next = q.next; } else { self.qhead = q.next; }
+            if (self.qtail == q) { self.qtail = prev; }
+            break;
+        }
+        prev = q;
+    }
+    if (!prev && self.qhead && self.qhead.co) { coro.unpark(self.qhead.co); }
+}
+
+/* Whether a request is in flight (open rows, or another coroutine's query) */
+static bool Conn.inUse()
+{
+    return self.qhead != null;
+}
+
+/* ---- the statement cache ---- */
+
+static Stmt *Conn.lookup(u8[] sql, u64 h)
+{
+    for (i64 i = 0; i < self.nstmts; i++) {
+        Stmt *st = self.stmts[i];
+        if (st.hash == h && st.sql.equals(sql)) { return st; }
+    }
+    return null;
+}
+
+static void Conn.removeStmt(Stmt *st)
+{
+    for (i64 i = 0; i < self.nstmts; i++) {
+        if (self.stmts[i] == st) {
+            self.stmts[i] = self.stmts[--self.nstmts];
+            break;
+        }
+    }
+    stmtFree(st);
+    mem.free(st);
+}
+
+/* The cached statement for sql, parsed and described on first use. r is
+ * not in the queue, before or after: the caller joins right before it
+ * appends its messages, with no pause in between, so the order of the
+ * queue is the order of the messages. */
+static Stmt *Conn.prepare(u8[] sql, Req *r)
 {
     u64 h = hash.fnv1a(sql);
-    for (i64 i = 0; i < self.nstmts; i++) {
-        Stmt *st = &self.stmts[i];
-        if (st.hash == h && st.sql.equals(sql)) {
+    while (true) {
+        Stmt *st = self.lookup(sql, h);
+        if (!st) { break; }
+        if (!st.pending) {
             st.lastUse = ++self.clock;
             return st;
         }
+        /* another coroutine prepares it: wait for that */
+        if (!coro.inLoop()) { throw(ERR_CLOSED, "pg: a statement is being prepared by another coroutine"); }
+        coro.park(1);               /* rare: only while the first one is prepared */
+        if (self.dead) { throw(ERR_IO, "pg: the connection broke while a statement was prepared"); }
     }
-    if (!self.stmts) { self.stmts = mem.allocZero(sizeof(Stmt) * STMT_CACHE); }
-    Stmt *st;
-    bool reused = false;
-    if (self.nstmts == STMT_CACHE) {
-        st = &self.stmts[0];
-        for (i64 i = 1; i < self.nstmts; i++) {
-            if (self.stmts[i].lastUse < st.lastUse) { st = &self.stmts[i]; }
+    /* a new one: evict the least recently used one nobody uses, if full */
+    if (self.nstmts >= STMT_CACHE) {
+        Stmt *old = null;
+        for (i64 i = 0; i < self.nstmts; i++) {
+            Stmt *s = self.stmts[i];
+            if (!s.pending && !s.refs && (!old || s.lastUse < old.lastUse)) { old = s; }
         }
-        self.begin('C');            /* Close the old one, in the same round trip */
-        self.put8('S');
-        self.putStr(st.name[0:st.nameLen]);
-        self.end();
-        stmtFree(st);
-        reused = true;
-    } else {
-        st = &self.stmts[self.nstmts];
+        if (old) {
+            self.begin('C');        /* Close it, in the same round trip */
+            self.put8('S');
+            self.putStr(old.name[0:old.nameLen]);
+            self.end();
+            self.removeStmt(old);
+        }
     }
-    mem.set(st, 0, sizeof(Stmt));
+    if (self.nstmts == self.stmtsCap) {
+        self.stmtsCap = self.stmtsCap ? self.stmtsCap * 2 : 32;
+        self.stmts = mem.realloc(self.stmts, sizeof(Stmt *) * self.stmtsCap);
+    }
+    Stmt *st = mem.allocZero(sizeof(Stmt));
+    self.stmts[self.nstmts++] = st;
+    st.pending = true;
+    st.sql = str.from(sql);
+    st.hash = h;
     st.nameLen = libc.snprintf(st.name, sizeof(st.name), "ktm_%d", self.stmtSeq++);
+    try {
+        self.join(r);
+    } catch (Error e) {
+        self.removeStmt(st);
+        throw(e);
+    }
     self.begin('P');
     self.putStr(st.name[0:st.nameLen]);
     self.putStr(sql);
@@ -717,55 +867,46 @@ static Stmt *Conn.prepare(u8[] sql)
     self.end();
     self.begin('S');
     self.end();
-    self.flush();
     bool failed = false;
     ServerError err;
-    while (true) {
-        u8 t;
-        try {
-            t = self.recv();
-        } catch (Error e) {
-            if (!failed) {
-                self.dropSlot(st, reused);
-                throw(e);
+    try {
+        self.flush();
+        self.turn(r);
+        while (true) {
+            u8 t;
+            try {
+                t = self.recv();
+            } catch (Error e) {
+                if (!failed) { throw(e); }
+                break;              /* the session ended after its error: throw that */
             }
-            break;                  /* the session ended after its error: throw that */
+            if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
+            if (failed) { continue; }
+            if (t == 'E') { err = self.serverErr(); failed = true; }
+            else if (t == 't') {
+                st.nparams = be16At(self.msg, 0);
+                st.paramOids = mem.alloc(4 * (st.nparams + 1));
+                for (i64 i = 0; i < st.nparams; i++) { st.paramOids[i] = be32At(self.msg, 2 + i * 4); }
+            } else if (t == 'T') {
+                self.readColumns(st);
+            }
+            /* '1' ParseComplete, '3' CloseComplete, 'n' NoData */
         }
-        if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
-        if (failed) { continue; }
-        if (t == 'E') { err = self.serverErr(); failed = true; }
-        else if (t == 't') {
-            st.nparams = be16At(self.msg, 0);
-            st.paramOids = mem.alloc(4 * (st.nparams + 1));
-            for (i64 i = 0; i < st.nparams; i++) { st.paramOids[i] = be32At(self.msg, 2 + i * 4); }
-        } else if (t == 'T') {
-            self.readColumns(st);
-        }
-        /* '1' ParseComplete, '3' CloseComplete, 'n' NoData */
+    } catch (Error e) {
+        if (failed) { err.message.free(); }
+        self.leave(r);
+        self.removeStmt(st);
+        throw(e);
     }
+    self.leave(r);
     if (failed) {
-        self.dropSlot(st, reused);
+        self.removeStmt(st);
         defer err.message.free();
         throw(err.code, "%s", err.message);
     }
-    st.sql = str.from(sql);
-    st.hash = h;
+    st.pending = false;
     st.lastUse = ++self.clock;
-    if (!reused) { self.nstmts++; }
     return st;
-}
-
-/* A statement that failed to prepare: free its slot */
-static void Conn.dropSlot(Stmt *st, bool reused)
-{
-    mem.free(st.paramOids);
-    for (i64 i = 0; i < st.ncols; i++) { st.cols[i].name.free(); }
-    mem.free(st.cols);
-    mem.set(st, 0, sizeof(Stmt));
-    if (reused) {                   /* the slot is empty now: fill it with the last one */
-        Stmt *last = &self.stmts[--self.nstmts];
-        if (last != st) { *st = *last; mem.set(last, 0, sizeof(Stmt)); }
-    }
 }
 
 /* A RowDescription into st.cols */
@@ -793,6 +934,7 @@ static void Conn.bindExecute(Stmt *st, reflect.Value[] args)
     if (args.len != st.nparams) {
         throw(ERR_ARG, "pg: the statement has %d parameters, %d given", st.nparams, args.len);
     }
+    i64 start = self.outLen;
     self.begin('B');
     self.put8(0);                   /* the unnamed portal */
     self.putStr(st.name[0:st.nameLen]);
@@ -802,7 +944,7 @@ static void Conn.bindExecute(Stmt *st, reflect.Value[] args)
     try {
         for (i64 i = 0; i < args.len; i++) { self.putArg(st.paramOids[i], args[i], i); }
     } catch (Error e) {
-        self.outLen = 0;            /* nothing of the Bind goes out */
+        self.outLen = start;        /* nothing of the Bind goes out */
         throw(e);
     }
     self.put16(st.ncols);
@@ -831,9 +973,14 @@ static i64 tagCount(u8[] tag)
  * the rows themselves are dropped */
 pub i64 Conn.execArgs(u8[] sql, reflect.Value[] args)
 {
-    self.ready();
-    Stmt *st = self.prepare(sql);
+    Req r;
+    Stmt *st = self.prepare(sql, &r);
+    self.join(&r);
+    defer self.leave(&r);
+    st.refs++;
+    defer st.refs--;
     self.bindExecute(st, args);
+    self.turn(&r);
     i64 n = 0;
     while (true) {
         u8 t = self.recv();
@@ -854,11 +1001,14 @@ pub i64 Conn.exec(u8[] sql, any ...args)
  * simple protocol). Returns the count of the last one. */
 pub i64 Conn.execScript(u8[] sql)
 {
-    self.ready();
+    Req r;
+    self.join(&r);
+    defer self.leave(&r);
     self.begin('Q');
     self.putStr(sql);
     self.end();
     self.flush();
+    self.turn(&r);
     i64 n = 0;
     while (true) {
         u8 t = self.recv();
@@ -873,21 +1023,32 @@ pub i64 Conn.execScript(u8[] sql)
  * rows.free() (or ad). The connection is busy until then. */
 pub Rows Conn.queryArgs(u8[] sql, reflect.Value[] args)
 {
-    self.ready();
-    Stmt *st = self.prepare(sql);
-    self.bindExecute(st, args);
+    Req *req = mem.allocZero(sizeof(Req));
+    Stmt *st;
+    bool joined = false;
+    try {
+        st = self.prepare(sql, req);
+        self.join(req);
+        joined = true;
+        self.bindExecute(st, args);
+    } catch (Error e) {
+        if (joined) { self.leave(req); }
+        mem.free(req);
+        throw(e);
+    }
+    st.refs++;
     Rows r;
     mem.set(&r, 0, sizeof(Rows));
     r.c = self;
     r.st = st;
+    r.req = req;
     r.cols = st.ncols;
     r.off = mem.alloc(sizeof(i32) * 2 * (st.ncols + 1));
-    self.busy = true;
     return r;
 }
 
 /* queryArgs with the parameters $1, $2 ... as arguments of any type */
-static Rows connOpen(Db *db, u8[] sql, reflect.Value[] args)
+static Rows connOpen(Db *db, u8[] sql, reflect.Value[] args, bool shared)
 {
     Conn *c = db;
     return c.queryArgs(sql, args);
