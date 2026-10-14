@@ -316,6 +316,11 @@ closed), `ERR_NO_ROWS`, `ERR_SCAN`, `ERR_POOL`, `ERR_PROTOCOL`, `ERR_ARG`, `ERR_
 
 ## Tests
 
+Beyond the suites: `tests/fuzz_test.ktm` replays damaged server messages (20000 rounds a run),
+and `bench/soak/` ran a `net.http` users API on ktm-pg for an hour under wrk (2.7 to 4.9 million
+requests a minute) with a Postgres restart at minute 30: errors only during the restart, none
+after it, the server's memory flat at 5.6 MB (`bench/soak/results-2026-10-14.jsonl`).
+
 `tests/run.sh` starts PostgreSQL 14 to 18 in Docker (ports 55414 to 55418, `tests/pg-up.sh`,
 with TLS from the test CA in `tests/tls`) and runs every test against each version, compiled and
 in the JIT with `-Memsafe`. `PGVER=17 tests/run.sh` runs one version.

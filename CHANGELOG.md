@@ -1,0 +1,27 @@
+# Changelog
+
+## v0.1.0 (2026-10-14)
+
+The first release: a PostgreSQL client for ktm, written in ktm, speaking the wire protocol
+itself.
+
+- Connecting: URLs and the `PG*` environment like libpq, Unix sockets, `connect_timeout`,
+  runtime parameters (`application_name`, `search_path`, `statement_timeout`...).
+- Authentication: SCRAM-SHA-256, SCRAM-SHA-256-PLUS (channel binding), md5, cleartext, trust,
+  client certificates.
+- TLS: `sslmode` disable, allow, prefer (the default), require, verify-ca and verify-full;
+  `sslrootcert`, `sslcert`, `sslkey`, `sslpassword`, `channel_binding`.
+- Statements: `exec` and `query` with `$1` parameters of any type, the extended protocol with a
+  statement cache, `execScript`, batches (`pg.Batch`, one round trip, one transaction).
+- Results: binary formats for the fixed-size types, `pg.queryAll<T>` and `pg.queryOne<T>` into
+  `@json` structs by column name, `rows.scan`, arrays, `pg.Interval`, exact `numeric` into
+  integers, NULLs as zero values, pointer fields or `pg.STRICT`.
+- Transactions, `COPY` in and out, `LISTEN` / `NOTIFY`.
+- A pool safe across the threads of `coro.serve` and `net.http`: per-thread shares of
+  `maxConns`, FIFO hand-off, health checks, lifetimes, recovery after a server restart.
+- Automatic pipelining: coroutines of a loop share a connection when all are busy.
+- Query timeouts with a server-side cancel; `Conn.cancel()`.
+- Errors carry the SQLSTATE in `Error.code` (`pg.UNIQUE_VIOLATION`, `pg.state("23505")`).
+- Tested on PostgreSQL 14 to 18, compiled and in the JIT with `-Memsafe`; fuzzed against
+  damaged server messages; a 1-hour soak under load with a server restart; benchmarked
+  against Go pgx (see the README).
