@@ -210,6 +210,38 @@ void scanning(pg.Conn *c)
     c.exec("DROP TABLE users_t");
 }
 
+/* numeric is exact into i64 and String, never through a float */
+struct Money { i64 cents; String amount; f64 approx; };
+
+void numeric(pg.Conn *c)
+{
+    ad pg.Rows r = c.query("SELECT 9007199254740993::numeric, 99999999999999999.00::numeric, -9223372036854775808::numeric,"
+                           " 9223372036854775808::numeric, 12.50::numeric, 'NaN'::numeric, 0.10::numeric, '-0'::numeric,"
+                           " 12345678901234567890.123456789::numeric");
+    t.ok(r.next(), "a row");
+    t.ok(r.int(0) == 9007199254740993, "2^53 + 1 exact (a float would say ...992)");
+    t.ok(r.int(1) == 99999999999999999, "a zero fraction is fine, exact");
+    t.ok(r.int(2) == I64_MIN, "I64_MIN");
+    i64 code = 0;
+    try { r.int(3); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_SCAN, "I64_MAX + 1 is ERR_SCAN");
+    code = 0;
+    try { r.int(4); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_SCAN, "12.50 into an integer is ERR_SCAN");
+    code = 0;
+    try { r.int(5); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_SCAN, "NaN into an integer is ERR_SCAN");
+    t.ok(r.float(6) == 0.1 && r.int(7) == 0, "f64 is the nearest float; -0 is 0");
+    t.ok(r.text(8).equals("12345678901234567890.123456789"), "text is exact");
+    r.free();
+    vec.Vec<Money> m = pg.queryAll<Money>(c, "SELECT 123456789012345678::numeric AS cents, 1234567890.12345678901234::numeric AS amount, 2.5::numeric AS approx");
+    t.ok(m.len == 1 && m.at(0).cents == 123456789012345678 && m.at(0).amount.equals("1234567890.12345678901234") && m.at(0).approx == 2.5, "scanned exact into i64 and String");
+    pg.free(reflect.of(m));
+    code = 0;
+    try { i64 x = pg.queryOne<i64>(c, "SELECT 1.5::numeric"); } catch (Error e) { code = e.code; }
+    t.ok(code == pg.ERR_SCAN, "1.5 into an i64 field is ERR_SCAN");
+}
+
 void dates()
 {
     i64 us[] = {0, 1, -1, 946684800000000, -62135596800000000, 253402300799999900, 1760445296123400};
@@ -228,6 +260,7 @@ i32 main()
     getters(c);
     params(c);
     scanning(c);
+    numeric(c);
     dates();
     c.close();
     return t.done();

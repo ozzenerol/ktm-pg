@@ -439,6 +439,44 @@ static i64 binMicros(u32 oid, u8[] b)
     return us + PG_EPOCH_DAYS * DAY_US;
 }
 
+/* Decimal text as an exact integer: digits, a sign, and a fraction only
+ * if it is all zeros (numeric 12.00). 0 and *out when it is one, 1 when
+ * it is a whole number too big for an i64, 2 when it isn't a whole
+ * number (a fraction, NaN, Infinity, not a number at all). Never goes
+ * through a float, so 9007199254740993 and money stay exact. */
+static i64 exactInt(u8[] s, i64 *out)
+{
+    i64 i = 0;
+    bool neg = false;
+    if (i < s.len && (s[i] == '-' || s[i] == '+')) {
+        neg = s[i] == '-';
+        i++;
+    }
+    i64 start = i;
+    u64 v = 0;
+    bool big = false;
+    while (i < s.len && s[i] >= '0' && s[i] <= '9') {
+        u64 d = s[i] - '0';
+        if (v > (U64_MAX - d) / 10) { big = true; } else { v = v * 10 + d; }
+        i++;
+    }
+    if (i == start) { return 2; }
+    if (i < s.len && s[i] == '.') {
+        i++;
+        while (i < s.len && s[i] == '0') { i++; }
+    }
+    if (i != s.len) { return 2; }
+    if (big) { return 1; }
+    if (neg) {
+        if (v > (u64)I64_MAX + 1) { return 1; }
+        *out = (i64)(0 - v);
+    } else {
+        if (v > (u64)I64_MAX) { return 1; }
+        *out = (i64)v;
+    }
+    return 0;
+}
+
 /* Column i as an integer: 0 for NULL. A bool is 0 or 1, a timestamp or
  * date its microseconds since 1970 (UTC). Throws ERR_SCAN for a value
  * that isn't a whole number. */
@@ -460,14 +498,16 @@ pub i64 Rows.int(i64 i)
         throw(ERR_SCAN, "pg: column %s: a %s isn't an integer", col.name, typeName(col.oid));
     }
     i64 n;
-    if (str.toInt(b, &n)) { return n; }
-    f64 x;
-    if (str.toFloat(b, &x) && x == (f64)(i64)x) { return (i64)x; }   /* numeric 12.00 */
-    throw(ERR_SCAN, "pg: column %s: \"%s\" isn't an integer", col.name, b);
+    i64 why = exactInt(b, &n);
+    if (why == 0) { return n; }
+    if (why == 1) { throw(ERR_SCAN, "pg: column %s: %s doesn't fit in an i64", col.name, b); }
+    throw(ERR_SCAN, "pg: column %s: \"%s\" isn't a whole number", col.name, b);
     return 0;
 }
 
-/* Column i as a float: 0 for NULL */
+/* Column i as a float: 0 for NULL. A numeric is rounded to the nearest
+ * f64 (15 to 17 digits): read money and big numerics with text() or
+ * int() (exact) instead. */
 pub f64 Rows.float(i64 i)
 {
     u8[] b;
