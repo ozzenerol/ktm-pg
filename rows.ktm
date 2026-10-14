@@ -20,6 +20,7 @@ pub struct Rows
     private bool own;           /* the connection goes back to its pool when the rows end */
     private Req *req;           /* its place in the connection's queue, until the rows end */
     private bool started;       /* its turn came: it reads */
+    private u8 *base;           /* the current row's message: off[] counts from here */
 };
 
 static void Rows.finish()
@@ -43,6 +44,7 @@ static void Rows.finish()
 pub bool Rows.next()
 {
     if (self.done) { return false; }
+    if (self.started && self.quickRow()) { return true; }
     Conn *c = self.c;
     try {
         if (!self.started) {
@@ -58,22 +60,61 @@ pub bool Rows.next()
     return false;
 }
 
+/* The next row without a try frame (a setjmp per row): only when a
+ * whole, well-formed DataRow is in the buffer already; anything else
+ * (more to read, another message, a bad row) goes the careful way */
+static bool Rows.quickRow()
+{
+    Conn *c = self.c;
+    i64 have = c.inEnd - c.inStart;
+    if (have < 7) { return false; }
+    u8 *p = c.in + c.inStart;
+    if (p[0] != 'D') { return false; }
+    i64 len = (i64)p[1] << 24 | (i64)p[2] << 16 | (i64)p[3] << 8 | p[4];
+    if (len < 6 || 1 + len > have) { return false; }
+    u8 *m = p + 5;
+    i64 mlen = len - 4;
+    i64 n = (i16)((u16)m[0] << 8 | m[1]);
+    if (n != self.cols) { return false; }
+    i64 at = 2;
+    i32 *off = self.off;
+    for (i64 i = 0; i < n; i++) {
+        if (at + 4 > mlen) { return false; }
+        i64 vl = (i32)((u32)m[at] << 24 | (u32)m[at + 1] << 16 | (u32)m[at + 2] << 8 | m[at + 3]);
+        at += 4;
+        if (vl < -1 || (vl > 0 && at + vl > mlen)) { return false; }
+        off[i * 2] = at;
+        off[i * 2 + 1] = vl;
+        if (vl > 0) { at += vl; }
+    }
+    c.msgType = 'D';
+    self.base = m;              /* not c.msg: a slice copy costs more than the row */
+    c.inStart += 1 + len;
+    self.row = true;
+    return true;
+}
+
 static bool Rows.read()
 {
     Conn *c = self.c;
     while (true) {
         u8 t = c.recv();
         if (t == 'D') {
-            u8[] m = c.msg;
-            i64 n = be16At(m, 0);
+            u8 *m = c.msg.ptr;
+            i64 mlen = c.msg.len;
+            self.base = m;
+            if (mlen < 2) { throw(ERR_PROTOCOL, "pg: a row too short"); }
+            i64 n = (i16)((u16)m[0] << 8 | m[1]);
             if (n != self.cols) { throw(ERR_PROTOCOL, "pg: a row of %d columns, expected %d", n, self.cols); }
             i64 at = 2;
+            i32 *off = self.off;
             for (i64 i = 0; i < n; i++) {
-                i64 len = be32At(m, at);
+                if (at + 4 > mlen) { throw(ERR_PROTOCOL, "pg: a row shorter than its columns"); }
+                i64 len = (i32)((u32)m[at] << 24 | (u32)m[at + 1] << 16 | (u32)m[at + 2] << 8 | m[at + 3]);
                 at += 4;
-                if (len < -1 || (len > 0 && at + len > m.len)) { throw(ERR_PROTOCOL, "pg: a value longer than its row"); }
-                self.off[i * 2] = at;
-                self.off[i * 2 + 1] = len;
+                if (len < -1 || (len > 0 && at + len > mlen)) { throw(ERR_PROTOCOL, "pg: a value longer than its row"); }
+                off[i * 2] = at;
+                off[i * 2 + 1] = len;
                 if (len > 0) { at += len; }
             }
             self.row = true;
@@ -135,7 +176,7 @@ pub u8[] Rows.raw(i64 i)
     self.check(i);
     i64 len = self.off[i * 2 + 1];
     if (len <= 0) { return ""; }
-    return self.c.msg[self.off[i * 2]:self.off[i * 2] + len];
+    return (self.base + self.off[i * 2])[0:len];
 }
 
 /* Column i's name */

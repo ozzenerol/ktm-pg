@@ -716,7 +716,7 @@ static bool Rows.value(i64 i, u8[] *b, Column **col)
     *col = &self.st.cols[i];
     i64 len = self.off[i * 2 + 1];
     if (len < 0) { *b = ""; return false; }
-    *b = self.c.msg[self.off[i * 2]:self.off[i * 2] + len];
+    *b = (self.base + self.off[i * 2])[0:len];
     return true;
 }
 

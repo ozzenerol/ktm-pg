@@ -100,6 +100,7 @@ const i64 SCRAM_MAX_ITER = 2000000;
  * connection is given up */
 const i64 CANCEL_GRACE_MS = 5000;
 const i64 IN_FIRST = 16384;
+const i64 IN_MAX = 262144;     /* the read buffer grows to this for big results */
 const i64 OUT_FIRST = 4096;
 
 /* ---- writing messages ---- */
@@ -260,7 +261,16 @@ static void Conn.fill(i64 n)
             if (got == 0) { os.setErrno(libc.ECONNRESET); }
             self.broken("receiving");
         }
+        bool full = self.inEnd + got == self.inCap;
         self.inEnd += got;
+        if (full && self.inCap < IN_MAX) {
+            /* a big result streams in: a bigger buffer, fewer reads */
+            u8 *p = mem.realloc(self.in, self.inCap * 2);
+            if (p) {
+                self.in = p;
+                self.inCap *= 2;
+            }
+        }
     }
 }
 
@@ -325,7 +335,7 @@ pub void Conn.setQueryTimeout(i64 ms)
 /* The next message, whatever it is: msgType and msg (valid until the next read) */
 static u8 Conn.readRaw()
 {
-    self.fill(5);
+    if (self.inEnd - self.inStart < 5) { self.fill(5); }
     u8 *p = self.in + self.inStart;
     i64 len = (i64)p[1] << 24 | (i64)p[2] << 16 | (i64)p[3] << 8 | p[4];
     if (len < 4 || len > 0x40000000) {
@@ -333,8 +343,10 @@ static u8 Conn.readRaw()
         self.s.close(&self.s);
         throw(ERR_PROTOCOL, "pg: a message of %d bytes", len);
     }
-    self.fill(1 + len);
-    p = self.in + self.inStart;
+    if (self.inEnd - self.inStart < 1 + len) {
+        self.fill(1 + len);
+        p = self.in + self.inStart;
+    }
     self.msgType = p[0];
     self.msg = p[5:1 + len];
     self.inStart += 1 + len;

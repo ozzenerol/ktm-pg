@@ -26,6 +26,10 @@ pub void Rows.scan(reflect.Value v, i64 flags = 0)
 {
     reflect.Type *t = v.type;
     if (!t || !v.ptr) { throw(ERR_SCAN, "pg: scan into nothing"); }
+    if (self.fieldOf && self.scanType == t) {    /* the same struct as the last row: mapped */
+        self.scanFields(v.ptr, t, flags);
+        return;
+    }
     if (t.kind != reflect.Kind.structType || isDate(t) || isVec(t) || isInterval(t)) {
         if (!self.cols) { throw(ERR_SCAN, "pg: scan: the query returns no columns"); }
         if ((flags & STRICT) && self.cols != 1) {
@@ -34,19 +38,26 @@ pub void Rows.scan(reflect.Value v, i64 flags = 0)
         self.scanValue(v, 0, flags);
         return;
     }
-    if (!self.fieldOf || self.scanType != t) { self.mapFields(t, flags); }
-    u8 *msg = self.c.msg.ptr;
+    self.mapFields(t, flags);
+    self.scanFields(v.ptr, t, flags);
+}
+
+/* A row into the struct at dst, mapped by mapFields */
+static void Rows.scanFields(void *dst, reflect.Type *t, i64 flags)
+{
+    if (!self.row) { throw(ERR_CLOSED, "pg: no current row: call rows.next() first"); }
+    u8 *msg = self.base;
     for (i64 i = 0; i < self.cols; i++) {
         i64 f = self.fieldOf[i * 2];
         if (f < 0) { continue; }
         reflect.Field *fd = &t.fields[f];
-        u8 *to = (u8 *)v.ptr + fd.offset;
+        u8 *to = (u8 *)dst + fd.offset;
         i64 len = self.off[i * 2 + 1];
         if (len >= 0) {
             u8 *at = msg + self.off[i * 2];
             switch (self.fieldOf[i * 2 + 1]) {     /* the common cases, without reflection */
                 case HOW_STRING:
-                    *(String *)to = str.from(at[0:len]);
+                    setString(to, at, len);
                     continue;
                 case HOW_I64:
                     if (len == 8) { *(i64 *)to = (i64)bytesBe64(at[0:8]); continue; }
@@ -63,6 +74,20 @@ pub void Rows.scan(reflect.Value v, i64 flags = 0)
     }
 }
 
+/* A String of exactly len bytes at to, a zeroed String field: one
+ * malloc, and its three words written directly (a String is a pointer,
+ * a length and a capacity) instead of a 24-byte struct copy per value */
+static void setString(u8 *to, u8 *at, i64 len)
+{
+    u8 *p = mem.alloc(len + 1);
+    for (i64 i = 0; i < len; i++) { p[i] = at[i]; }
+    p[len] = 0;
+    u64 *w = (u64 *)to;
+    w[0] = (u64)p;
+    w[1] = (u64)len;
+    w[2] = (u64)len;
+}
+
 /* How a column goes into its field (mapFields): the fast ways */
 const i32 HOW_GENERAL = 0;
 const i32 HOW_STRING = 1;      /* a text-format column into a String */
@@ -72,6 +97,7 @@ const i32 HOW_BOOL = 4;        /* a binary bool into a bool */
 
 static i32 howOf(Column *col, reflect.Type *ft)
 {
+    if (sizeof(String) != 24) { return HOW_GENERAL; }  /* setString writes three words */
     if (isDate(ft) || isInterval(ft) || arrayElem(col.oid)) { return HOW_GENERAL; }
     if (ft.kind == reflect.Kind.string && !col.format && col.oid != JSON && col.oid != JSONB) { return HOW_STRING; }
     if (!col.format) { return HOW_GENERAL; }
@@ -251,9 +277,10 @@ static vec.Vec<T> rowsAll<T>(Rows *r)
     vec.Vec<T> out = vec.new<T>();
     T x;
     mem.set(&x, 0, sizeof(T));
+    reflect.Value xv = reflect.of(x);
     try {
         while (r.next()) {
-            r.scan(reflect.of(x));
+            if (r.fieldOf && r.scanType == xv.type) { r.scanFields(&x, xv.type, 0); } else { r.scan(xv); }
             out.push(x);
             mem.set(&x, 0, sizeof(T));
         }
