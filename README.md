@@ -31,7 +31,8 @@ void main()
     defer c.close();
 
     c.exec("CREATE TABLE IF NOT EXISTS users (id bigserial PRIMARY KEY, name text, email text UNIQUE)");
-    i64 id = pg.queryOne<i64>(c, "INSERT INTO users (name, email) VALUES ($1, $2) RETURNING id", "Ada", "ada@example.com");
+    i64 id = pg.queryOne<i64>(c, "INSERT INTO users (name, email) VALUES ($1, $2) "
+                                 "ON CONFLICT (email) DO UPDATE SET name = excluded.name RETURNING id", "Ada", "ada@example.com");
 
     vec.Vec<User> users = pg.queryAll<User>(c, "SELECT id, name, email FROM users WHERE id >= $1", 1);
     defer pg.free(reflect.of(users));
