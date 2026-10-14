@@ -12,6 +12,7 @@ pub struct Options
     i64 maxLifetimeMs;      /* a connection is closed after this, at its next release (0: 1 hour) */
     i64 acquireTimeoutMs;   /* waiting for a free connection longer throws ERR_POOL (0: 30 s) */
     i64 healthCheckMs;      /* a connection idle this long is checked before it is handed out (0: 1 s) */
+    i64 queryTimeoutMs;     /* every query's limit, see Conn.setQueryTimeout (0: none) */
 };
 
 /* The connections of one thread (and one kind: loop coroutines or plain
@@ -48,6 +49,7 @@ pub struct Pool : Db
     private i64 maxLifetimeMs;
     private i64 acquireMs;
     private i64 healthMs;
+    private i64 queryMs;
     private i64 nopen;          /* connections open (atomic) */
     private i64 nwaiting;       /* waiters in every shard (atomic) */
     private Shard **shards;     /* up to MAX_SHARDS; never moved, so reads need no lock */
@@ -78,6 +80,7 @@ pub Pool *open(u8[] url = "", Options *opts = null)
     p.maxLifetimeMs = o.maxLifetimeMs > 0 ? o.maxLifetimeMs : 60 * 60 * 1000;
     p.acquireMs = o.acquireTimeoutMs > 0 ? o.acquireTimeoutMs : 30000;
     p.healthMs = o.healthCheckMs > 0 ? o.healthCheckMs : 1000;
+    p.queryMs = o.queryTimeoutMs > 0 ? o.queryTimeoutMs : 0;
     p.shards = mem.allocZero(sizeof(Shard *) * MAX_SHARDS);
     return p;
 }
@@ -249,7 +252,10 @@ pub Conn *Pool.acquire()
             Conn *c = s.idle[s.nidle - 1];
             atomic.store(&s.nidle, s.nidle - 1);
             s.unlock_();
-            if (self.usable(c, now)) { return c; }
+            if (self.usable(c, now)) {
+                c.timeoutMs = self.queryMs;
+                return c;
+            }
             self.discard(c);
         }
         if (atomic.add(&self.nopen, 1) < self.maxConns) {
@@ -263,6 +269,7 @@ pub Conn *Pool.acquire()
             }
             c.pool = self;
             c.shard = s;
+            c.timeoutMs = self.queryMs;
             return c;
         }
         atomic.sub(&self.nopen, 1);

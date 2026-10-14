@@ -1,5 +1,5 @@
 module pg;
-import date, hash, libc, mem, os, reflect, str;
+import coro, date, hash, libc, mem, os, reflect, str;
 
 /* What a Conn, a Tx and a Pool have in common: pg.queryAll and
  * pg.queryOne take any of them as a Db * */
@@ -37,6 +37,11 @@ pub struct Conn : Db
     private i64 born;           /* date.monoMs() when it connected */
     private i64 idleSince;
     private void *shard;
+    private String host;        /* where it connected: a CancelRequest goes there too */
+    private i32 port;
+    private i64 timeoutMs;      /* per query, 0: none */
+    private i64 deadline;       /* date.monoMs() the running query must end by, 0: none */
+    private bool cancelSent;
 };
 
 /* A prepared statement of the cache */
@@ -62,6 +67,10 @@ struct Column
 };
 
 const i64 STMT_CACHE = 256;
+
+/* After a CancelRequest, the server has this long to answer before the
+ * connection is given up */
+const i64 CANCEL_GRACE_MS = 5000;
 const i64 IN_FIRST = 16384;
 const i64 OUT_FIRST = 4096;
 
@@ -165,13 +174,74 @@ static void Conn.fill(i64 n)
         self.inCap = cap;
     }
     while (self.inEnd - self.inStart < n) {
+        if (self.deadline) {
+            i64 left = self.deadline - date.monoMs();
+            if (left <= 0) { self.timedOut(); continue; }
+            self.s.timeoutMs = left;
+        }
         i64 got = self.s.read(&self.s, self.in[self.inEnd:self.inCap]);
         if (got <= 0) {
+            if (got < 0 && self.deadline && os.errno() == libc.ETIMEDOUT) { self.timedOut(); continue; }
             if (got == 0) { os.setErrno(libc.ECONNRESET); }
             self.broken("receiving");
         }
         self.inEnd += got;
     }
+}
+
+/* The running query passed its deadline: ask the server to cancel it
+ * (the answer is its 57014 error, and the connection stays usable), or,
+ * when that was asked already and nothing came, give the connection up */
+static void Conn.timedOut()
+{
+    if (!self.cancelSent) {
+        self.cancelSent = true;
+        self.sendCancel();
+        self.deadline = date.monoMs() + CANCEL_GRACE_MS;
+        return;
+    }
+    self.deadline = 0;
+    self.dead = true;
+    self.s.close(&self.s);
+    throw(ERR_IO, "pg: the query timed out after %d ms and the server didn't answer the cancel: connection closed",
+          self.timeoutMs);
+}
+
+/* A CancelRequest for this connection's query, on a connection of its
+ * own. Waits until the server closes that one, so the cancel has reached
+ * the backend before the query's connection is used again. */
+static void Conn.sendCancel()
+{
+    Stream cs;
+    mem.set(&cs, 0, sizeof(Stream));
+    if (!streamDial(&cs, self.host, self.port, 2000)) { return; }
+    cs.timeoutMs = 2000;
+    u8 m[16];
+    m[0] = 0; m[1] = 0; m[2] = 0; m[3] = 16;
+    m[4] = 0x04; m[5] = 0xD2; m[6] = 0x16; m[7] = 0x2E;   /* 80877102 */
+    m[8] = (self.pid >> 24) & 0xFF; m[9] = (self.pid >> 16) & 0xFF; m[10] = (self.pid >> 8) & 0xFF; m[11] = self.pid & 0xFF;
+    m[12] = (self.secret >> 24) & 0xFF; m[13] = (self.secret >> 16) & 0xFF;
+    m[14] = (self.secret >> 8) & 0xFF; m[15] = self.secret & 0xFF;
+    if (cs.write(&cs, m[0:16])) {
+        u8 b[16];
+        while (cs.read(&cs, b[0:16]) > 0) { }
+    }
+    cs.close(&cs);
+}
+
+/* Cancels the query running on the connection, from another coroutine
+ * or thread: it ends with QUERY_CANCELED (57014) */
+pub void Conn.cancel()
+{
+    self.sendCancel();
+}
+
+/* Every query on this connection must end within ms milliseconds (0: no
+ * limit). One that doesn't is cancelled on the server and throws
+ * QUERY_CANCELED; the connection stays usable. */
+pub void Conn.setQueryTimeout(i64 ms)
+{
+    self.timeoutMs = ms > 0 ? ms : 0;
 }
 
 /* The next message, whatever it is: msgType and msg (valid until the next read) */
@@ -267,10 +337,21 @@ static ServerError serverError(u8[] m)
     return e;
 }
 
+/* The ErrorResponse just read, saying so when our timeout cancelled it */
+static ServerError Conn.serverErr()
+{
+    ServerError e = serverError(self.msg);
+    if (self.cancelSent && e.code == QUERY_CANCELED) {
+        ad String pre = str.format("timeout after %d ms: ", self.timeoutMs);
+        e.message.insert(0, pre);
+    }
+    return e;
+}
+
 /* After an ErrorResponse: read up to ReadyForQuery, then throw it */
 static void Conn.throwServerError()
 {
-    ServerError e = serverError(self.msg);
+    ServerError e = self.serverErr();
     defer e.message.free();
     try { self.drain(); } catch { }     /* a FATAL error ends the session: its error says why */
     throw(e.code, "%s", e.message);
@@ -311,6 +392,8 @@ static Conn *connectConfig(Config *cfg)
         throw(ERR_CONNECT, "pg: can't connect to %s:%d: %s", cfg.host, cfg.port, libc.strerror(err));
     }
     c.born = date.monoMs();
+    c.host = str.from(cfg.host);
+    c.port = cfg.port;
     try {
         c.startup(cfg);
     } catch (Error e) {
@@ -495,6 +578,7 @@ static void Conn.release_()
     mem.free(self.in);
     mem.free(self.out);
     self.version.free();
+    self.host.free();
     mem.free(self);
 }
 
@@ -554,6 +638,10 @@ static void Conn.ready()
 {
     if (self.dead) { throw(ERR_CLOSED, "pg: the connection is closed"); }
     if (self.busy) { throw(ERR_CLOSED, "pg: the connection still has open rows: free them first"); }
+    self.s.setLoop(coro.inLoop());
+    self.cancelSent = false;
+    self.deadline = self.timeoutMs ? date.monoMs() + self.timeoutMs : 0;
+    self.s.timeoutMs = -1;          /* fill() sets it while there is a deadline */
 }
 
 /* The cached statement for sql, parsed and described on first use */
@@ -613,7 +701,7 @@ static Stmt *Conn.prepare(u8[] sql)
         }
         if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
         if (failed) { continue; }
-        if (t == 'E') { err = serverError(self.msg); failed = true; }
+        if (t == 'E') { err = self.serverErr(); failed = true; }
         else if (t == 't') {
             st.nparams = be16At(self.msg, 0);
             st.paramOids = mem.alloc(4 * (st.nparams + 1));

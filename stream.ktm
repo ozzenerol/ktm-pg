@@ -20,6 +20,18 @@ struct Stream
 static i64 tcpRead(Stream *s, u8[] buf)
 {
     if (s.loop) { return coro.read(s.fd, buf, s.timeoutMs); }
+    if (s.timeoutMs >= 0) {
+        libc.pollfd p;
+        p.fd = s.fd;
+        p.events = libc.POLLIN;
+        p.revents = 0;
+        while (true) {
+            i32 r = libc.poll(&p, 1, s.timeoutMs > 0x7FFFFFFF ? 0x7FFFFFFF : s.timeoutMs);
+            if (r > 0) { break; }
+            if (r == 0) { os.setErrno(libc.ETIMEDOUT); return -1; }
+            if (os.errno() != libc.EINTR) { return -1; }
+        }
+    }
     while (true) {
         i64 n = libc.read(s.fd, buf.ptr, buf.len);
         if (n >= 0 || os.errno() != libc.EINTR) { return n; }
@@ -47,6 +59,16 @@ static void tcpClose(Stream *s)
     if (s.fd < 0) { return; }
     if (s.loop) { coro.close(s.fd); } else { libc.close(s.fd); }
     s.fd = -1;
+}
+
+/* The stream is used in a loop coroutine now (or no longer): switch
+ * between non-blocking and blocking I/O. A connection made in main()
+ * and used in coroutines then pauses only its coroutine. */
+static void Stream.setLoop(bool loop)
+{
+    if (loop == self.loop || self.fd < 0) { return; }
+    if (loop) { net.setNonBlocking(self.fd); } else { net.setBlocking(self.fd); }
+    self.loop = loop;
 }
 
 /* A plain stream to host:port, or to the Unix socket in directory host

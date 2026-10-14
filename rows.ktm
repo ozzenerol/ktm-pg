@@ -68,7 +68,7 @@ pub bool Rows.next()
             return false;
         }
         if (t == 'E') {
-            ServerError e = serverError(c.msg);
+            ServerError e = c.serverErr();
             defer e.message.free();
             try { c.drain(); } catch { }
             self.finish();

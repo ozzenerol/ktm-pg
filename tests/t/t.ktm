@@ -1,5 +1,5 @@
 module t;
-import cstr, libc, str;
+import cstr, libc, os, str;
 
 /* The test helpers: a check counter and the URL of the server under test
  * (PGVER, default 17: port 554<PGVER>) */
@@ -17,6 +17,8 @@ pub void start(u8[] name)
 pub void ok(bool cond, u8 *what)
 {
     gChecks++;
+    u8 *verbose = libc.getenv("T_VERBOSE");
+    if (verbose && verbose[0]) { printf("\n  %s: %s", cond ? "ok" : "no", what); os.flush(); }
     if (!cond) {
         gFailed++;
         printf("\n  FAIL: %s", what);

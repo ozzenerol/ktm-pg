@@ -20,18 +20,19 @@ for f in "$dir"/*_test.ktm; do
         for mode in aot jit; do
             total=$((total + 1))
             if [ $mode = aot ]; then
-                out=$(cd "$dir" && PGVER=$v timeout 120 "$work/$name" 2>&1)
+                out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 "$work/$name" 2>&1)
             else
-                out=$(cd "$dir" && PGVER=$v timeout 120 ktm -jit -Memsafe "$f" 2>&1)
+                out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 ktm -jit -Memsafe "$f" 2>&1)
             fi
             code=$?
-            line=$(printf '%s\n' "$out" | grep -a "^Test - " | tail -1)
+            line=$(printf '%s\n' "$out" | grep -ao '[0-9]*/[0-9]* passed$' | tail -1)
             if [ $code -ne 0 ] || printf '%s\n' "$out" | grep -aq -e FAIL -e "double free" -e "leak" -e "wild free"; then
                 echo "pg $v $mode $name: FAILED (exit $code)"
-                printf '%s\n' "$out" | tail -20
+                printf '%s\n' "$out" | grep -av "^  ok: " | tail -20
+                printf '%s\n' "$out" | grep -a "^  ok: " | tail -1 | sed 's/^/  last check passed:/' 
                 fail=$((fail + 1))
             else
-                echo "pg $v $mode ${line#Test - }"
+                echo "pg $v $mode $name: $line"
             fi
         done
     done
