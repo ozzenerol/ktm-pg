@@ -56,6 +56,7 @@ struct Waiter
     Conn *got;              /* handed over by poolPut */
     Waiter *next;
     coro.Coroutine *co;     /* parked in its loop (null for a plain thread: it polls) */
+    Shard *shard;
 };
 
 /* A pool of connections, safe to share between the threads of
@@ -254,13 +255,16 @@ static void Pool.wakeOne()
     any.unlock_();
 }
 
-/* Pause until woken or the deadline (a second at most: a safety net) */
+/* Pause until woken or the deadline: a second at most (a safety net),
+ * or just past STARVE_MS for a thread with no connection at all, as
+ * another thread's idle one may be taken by then without a wake-up */
 static void Pool.wait(Waiter *w, i64 deadline)
 {
     i64 left = deadline - date.monoMs();
     if (left <= 0) { return; }
     if (w.co) {
-        coro.park(left > 1000 ? 1000 : left);
+        i64 most = atomic.load(&w.shard.nconns) ? 1000 : STARVE_MS + 5;
+        coro.park(left > most ? most : left);
     } else {
         date.sleepMs(1);
     }
@@ -404,6 +408,7 @@ static Conn *Pool.take(bool own)
     w.got = null;
     w.next = null;
     w.co = s.loop ? coro.current() : null;
+    w.shard = s;
     bool queued = false;
     bool first = false;
     if (own) { s.xwaiters++; }

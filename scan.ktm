@@ -34,19 +34,57 @@ pub void Rows.scan(reflect.Value v, i64 flags = 0)
         self.scanValue(v, 0, flags);
         return;
     }
-    if (!self.fieldOf || !reflect.same(self.scanType, t)) { self.mapFields(t, flags); }
+    if (!self.fieldOf || self.scanType != t) { self.mapFields(t, flags); }
+    u8 *msg = self.c.msg.ptr;
     for (i64 i = 0; i < self.cols; i++) {
-        i64 f = self.fieldOf[i];
+        i64 f = self.fieldOf[i * 2];
         if (f < 0) { continue; }
         reflect.Field *fd = &t.fields[f];
-        self.scanValue(reflect.__value((u8 *)v.ptr + fd.offset, fd.type), i, flags);
+        u8 *to = (u8 *)v.ptr + fd.offset;
+        i64 len = self.off[i * 2 + 1];
+        if (len >= 0) {
+            u8 *at = msg + self.off[i * 2];
+            switch (self.fieldOf[i * 2 + 1]) {     /* the common cases, without reflection */
+                case HOW_STRING:
+                    *(String *)to = str.from(at[0:len]);
+                    continue;
+                case HOW_I64:
+                    if (len == 8) { *(i64 *)to = (i64)bytesBe64(at[0:8]); continue; }
+                    if (len == 4) { *(i64 *)to = (i32)bytesBe32(at[0:4]); continue; }
+                case HOW_F64:
+                    if (len == 8) { u64 u = bytesBe64(at[0:8]); *(f64 *)to = *(f64 *)&u; continue; }
+                case HOW_BOOL:
+                    if (len == 1) { *(bool *)to = at[0] != 0; continue; }
+                default:
+                    break;
+            }
+        }
+        self.scanValue(reflect.__value(to, fd.type), i, flags);
     }
+}
+
+/* How a column goes into its field (mapFields): the fast ways */
+const i32 HOW_GENERAL = 0;
+const i32 HOW_STRING = 1;      /* a text-format column into a String */
+const i32 HOW_I64 = 2;         /* a binary int8 or int4 into an i64 */
+const i32 HOW_F64 = 3;         /* a binary float8 into an f64 */
+const i32 HOW_BOOL = 4;        /* a binary bool into a bool */
+
+static i32 howOf(Column *col, reflect.Type *ft)
+{
+    if (isDate(ft) || isInterval(ft) || arrayElem(col.oid)) { return HOW_GENERAL; }
+    if (ft.kind == reflect.Kind.string && !col.format && col.oid != JSON && col.oid != JSONB) { return HOW_STRING; }
+    if (!col.format) { return HOW_GENERAL; }
+    if (ft.kind == reflect.Kind.int && ft.size == 8 && ft.isSigned && (col.oid == INT8 || col.oid == INT4)) { return HOW_I64; }
+    if (ft.kind == reflect.Kind.float && ft.size == 8 && col.oid == FLOAT8) { return HOW_F64; }
+    if (ft.kind == reflect.Kind.boolean && ft.size == 1 && col.oid == BOOL) { return HOW_BOOL; }
+    return HOW_GENERAL;
 }
 
 /* Which field each column fills: its key exactly, else ignoring case */
 static void Rows.mapFields(reflect.Type *t, i64 flags)
 {
-    if (!self.fieldOf) { self.fieldOf = mem.alloc(sizeof(i32) * (self.cols + 1)); }
+    if (!self.fieldOf) { self.fieldOf = mem.alloc(sizeof(i32) * 2 * (self.cols + 1)); }
     self.scanType = t;
     for (i64 i = 0; i < self.cols; i++) {
         u8[] name = self.st.cols[i].name;
@@ -60,19 +98,19 @@ static void Rows.mapFields(reflect.Type *t, i64 flags)
             if (!f.skip && !f.isPrivate && str.equalsFold(f.key, name)) { found = j; }
         }
         if (found < 0 && (flags & STRICT)) {
-            self.fieldOf[0] = -1;
             mem.free(self.fieldOf);
             self.fieldOf = null;
             throw(ERR_SCAN, "pg: column %s: no such field in %s", name, t.name);
         }
-        self.fieldOf[i] = found;
+        self.fieldOf[i * 2] = found;
+        self.fieldOf[i * 2 + 1] = found < 0 ? HOW_GENERAL : howOf(&self.st.cols[i], t.fields[found].type);
     }
     if (flags & STRICT) {
         for (i64 j = 0; j < t.fields.len; j++) {
             reflect.Field *f = &t.fields[j];
             if (f.skip || f.isPrivate) { continue; }
             bool has = false;
-            for (i64 i = 0; i < self.cols; i++) { if (self.fieldOf[i] == j) { has = true; } }
+            for (i64 i = 0; i < self.cols; i++) { if (self.fieldOf[i * 2] == j) { has = true; } }
             if (!has) {
                 mem.free(self.fieldOf);
                 self.fieldOf = null;
