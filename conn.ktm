@@ -1,5 +1,5 @@
 module pg;
-import atomic, coro, date, hash, libc, mem, os, reflect, str;
+import atomic, coro, date, hash, libc, mem, net.tls, os, reflect, str;
 
 /* What a Conn, a Tx and a Pool have in common: pg.queryAll and
  * pg.queryOne take any of them as a Db * */
@@ -49,6 +49,10 @@ pub struct Conn : Db
     private bool cancelSent;
     private i64 users;          /* pool calls sharing it (pipelining), 0 when one owner has it */
     private bool draining;      /* shared, but takes no new calls: it goes back when they are done */
+    private tls.Context *tlsCtx;    /* the TLS context its session uses (a cancel uses it too) */
+    private tls.Context *ownCtx;    /* the same, when this connection frees it (pg.connect) */
+    private Note *noteHead;         /* notifications not read yet */
+    private Note *noteTail;
 };
 
 /* A request on the connection: its messages are sent, and its answer
@@ -160,6 +164,17 @@ static void Conn.end()
 static void Conn.broken(u8 *what)
 {
     i32 err = os.errno();
+    if (self.s.impl) {              /* TLS: its reason says more than errno */
+        ad String why = str.from(self.s.impl.error());
+        self.dead = true;
+        self.s.close(&self.s);
+        self.wakeAll();
+        if (why.len) {
+            i64 code = str.contains(why, "alert") || str.contains(why, "certificate") ? ERR_TLS : ERR_IO;
+            throw(code, "pg: connection lost while %s: %s", what, why);
+        }
+        throw(ERR_IO, "pg: connection lost while %s: %s", what, libc.strerror(err));
+    }
     self.dead = true;
     self.s.close(&self.s);
     self.wakeAll();
@@ -263,6 +278,9 @@ static void Conn.sendCancel()
     mem.set(&cs, 0, sizeof(Stream));
     if (!streamDial(&cs, self.host, self.port, 2000)) { return; }
     cs.timeoutMs = 2000;
+    if (self.tlsCtx) {
+        try { cs.startTls(self.tlsCtx, self.host); } catch { cs.close(&cs); return; }
+    }
     u8 m[16];
     m[0] = 0; m[1] = 0; m[2] = 0; m[3] = 16;
     m[4] = 0x04; m[5] = 0xD2; m[6] = 0x16; m[7] = 0x2E;   /* 80877102 */
@@ -324,7 +342,8 @@ static u8 Conn.recv()
             }
             continue;
         }
-        if (t == 'N' || t == 'A') { continue; }
+        if (t == 'A') { self.queueNote(); continue; }
+        if (t == 'N') { continue; }
         return t;
     }
     return 0;
@@ -425,7 +444,10 @@ static void Conn.drain()
 pub Conn *connect(u8[] url = "")
 {
     ad Config cfg = configParse(url);
-    return connectConfig(&cfg);
+    Conn *c = connectConfig(&cfg);
+    c.ownCtx = cfg.tlsCtx;          /* the Config goes now; the session keeps its context */
+    cfg.tlsCtx = null;
+    return c;
 }
 
 static Conn *connectConfig(Config *cfg)
@@ -442,12 +464,38 @@ static Conn *connectConfig(Config *cfg)
     c.host = str.from(cfg.host);
     c.port = cfg.port;
     try {
+        c.negotiateTls(cfg);
         c.startup(cfg);
     } catch (Error e) {
         c.release_();
         throw(e);
     }
     return c;
+}
+
+/* TLS as sslmode says: disable none; allow and prefer when the server
+ * has it; require, verify-ca and verify-full or fail */
+static void Conn.negotiateTls(Config *cfg)
+{
+    if (cfg.sslMode == SSL_DISABLE || (cfg.host.len && cfg.host[0] == '/')) { return; }
+    if (cfg.connectTimeoutMs > 0) { self.s.timeoutMs = cfg.connectTimeoutMs; }
+    tls.Context *ctx = cfg.tlsContext();
+    if (self.s.startTls(ctx, cfg.host)) {
+        self.tlsCtx = ctx;
+        return;
+    }
+    if (self.s.fd < 0) { throw(ERR_CONNECT, "pg: the server closed the connection at the TLS request"); }
+    if (cfg.sslMode >= SSL_REQUIRE) {
+        throw(ERR_TLS, "pg: sslmode=%s, but the server doesn't do TLS",
+              cfg.sslMode == SSL_REQUIRE ? "require" : cfg.sslMode == SSL_VERIFY_CA ? "verify-ca" : "verify-full");
+    }
+}
+
+/* Whether the session is encrypted, and how ("TLSv1.3"; "" if not) */
+pub u8[] Conn.tlsVersion()
+{
+    if (!self.s.impl) { return ""; }
+    return self.s.impl.version();
 }
 
 static void Conn.startup(Config *cfg)
@@ -497,6 +545,8 @@ static void Conn.startup(Config *cfg)
 /* SCRAM-SHA-256 in progress */
 struct Scram
 {
+    bool plus;                  /* SCRAM-SHA-256-PLUS: channel binding to the TLS session */
+    String gs2;
     String clientFirstBare;
     String nonce;
     u8 serverSig[32];
@@ -504,6 +554,7 @@ struct Scram
 
 static void Scram.free()
 {
+    self.gs2.free();
     self.clientFirstBare.free();
     self.nonce.free();
 }
@@ -518,7 +569,12 @@ static void Conn.needPassword(Config *cfg, u8 *method)
 static void Conn.auth(Config *cfg, Scram *sc)
 {
     i64 kind = be32At(self.msg, 0);
-    if (kind == 0) { return; }       /* AuthenticationOk */
+    if (kind == 0) {                 /* AuthenticationOk */
+        if (cfg.channelBinding == CB_REQUIRE && !sc.plus) {
+            throw(ERR_AUTH, "pg: channel_binding=require, but the server authenticated without it");
+        }
+        return;
+    }
     if (kind == 3) {                 /* cleartext */
         self.needPassword(cfg, "cleartext");
         self.begin('p');
@@ -538,24 +594,38 @@ static void Conn.auth(Config *cfg, Scram *sc)
         return;
     }
     if (kind == 10) {                /* SASL: the mechanisms */
-        bool scram = false;
+        bool scram = false, plus = false;
         i64 at = 4;
         while (at < self.msg.len && self.msg[at]) {
             u8[] m = cstrAt(self.msg, at);
             if (m.equals("SCRAM-SHA-256")) { scram = true; }
+            if (m.equals("SCRAM-SHA-256-PLUS")) { plus = true; }
             at += m.len + 1;
         }
-        if (!scram) { throw(ERR_AUTH, "pg: the server offers no SASL mechanism ktm-pg knows (it needs SCRAM-SHA-256)"); }
+        bool tlsOn = self.s.impl != null;
+        sc.plus = plus && tlsOn && cfg.channelBinding != CB_DISABLE;
+        if (cfg.channelBinding == CB_REQUIRE && !sc.plus) {
+            throw(ERR_AUTH, "pg: channel_binding=require, but %s", tlsOn ? "the server doesn't offer SCRAM-SHA-256-PLUS" : "the connection isn't TLS");
+        }
+        if (!scram && !sc.plus) { throw(ERR_AUTH, "pg: the server offers no SASL mechanism ktm-pg knows (it needs SCRAM-SHA-256)"); }
         self.needPassword(cfg, "SCRAM-SHA-256");
         u8 raw[18];
         randomBytes(raw[0:18]);
         sc.nonce = str.new();
         base64Append(&sc.nonce, raw[0:18]);
         sc.clientFirstBare = str.format("n=,r=%s", sc.nonce);
+        /* the GS2 header: p= with channel binding; y when we could bind but
+         * the server can't (TLS without -PLUS); n without TLS */
+        u8[] gs2 = "n,,";
+        if (sc.plus) { gs2 = "p=tls-server-end-point,,"; }
+        else if (tlsOn && cfg.channelBinding != CB_DISABLE) { gs2 = "y,,"; }
+        sc.gs2 = str.from(gs2);
+        u8[] mech = "SCRAM-SHA-256";
+        if (sc.plus) { mech = "SCRAM-SHA-256-PLUS"; }
         self.begin('p');
-        self.putStr("SCRAM-SHA-256");
-        self.put32(3 + sc.clientFirstBare.len);
-        self.putBytes("n,,");
+        self.putStr(mech);
+        self.put32(sc.gs2.len + sc.clientFirstBare.len);
+        self.putBytes(sc.gs2);
         self.putBytes(sc.clientFirstBare);
         self.end();
         self.flush();
@@ -616,7 +686,20 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
         atomic.store(&cfg.scramLock, 0);
     }
     hash.sha256(clientKey[0:32], storedKey[0:32]);
-    ad String finalBare = str.format("c=biws,r=%s", r);
+    /* c=: the GS2 header, and with -PLUS the hash of the server's
+     * certificate (tls-server-end-point, RFC 5929) */
+    ad String cbind = str.from(sc.gs2);
+    if (sc.plus) {
+        i32 md = 0;
+        u8[] der = self.s.impl.peerCert(&md);
+        if (!der.len) { throw(ERR_AUTH, "pg: SCRAM-SHA-256-PLUS: the server sent no certificate"); }
+        u8 h[64];
+        i64 hl = certHash(der, md, h);
+        cbind.append(h[0:hl]);
+    }
+    ad String finalBare = str.from("c=");
+    base64Append(&finalBare, cbind);
+    finalBare.appendFormat(",r=%s", r);
     ad String authMsg = str.format("%s,%s,%s", sc.clientFirstBare, serverFirst, finalBare);
     hmacSha256(storedKey[0:32], authMsg, sig[0:32]);
     u8 proof[32];
@@ -647,6 +730,8 @@ static void Conn.release_()
     mem.free(self.out);
     self.version.free();
     self.host.free();
+    self.freeNotes();
+    if (self.ownCtx) { self.ownCtx.free(); }
     mem.free(self);
 }
 
@@ -929,7 +1014,7 @@ static void Conn.readColumns(Stmt *st)
 /* ---- running statements ---- */
 
 /* Bind st's parameters, Execute and Sync, all in one write */
-static void Conn.bindExecute(Stmt *st, reflect.Value[] args)
+static void Conn.bindExecute(Stmt *st, reflect.Value[] args, bool sync = true)
 {
     if (args.len != st.nparams) {
         throw(ERR_ARG, "pg: the statement has %d parameters, %d given", st.nparams, args.len);
@@ -954,6 +1039,7 @@ static void Conn.bindExecute(Stmt *st, reflect.Value[] args)
     self.put8(0);
     self.put32(0);
     self.end();
+    if (!sync) { return; }
     self.begin('S');
     self.end();
     self.flush();

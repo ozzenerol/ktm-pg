@@ -1,5 +1,5 @@
 module pg;
-import coro, libc, net, os, str;
+import coro, libc, net, net.tls, os, str;
 
 /* Every byte to and from the server goes through a Stream: plain TCP (or
  * a Unix socket) now, TLS later as a second implementation of the same
@@ -11,7 +11,7 @@ struct Stream
     i32 fd;
     bool loop;          /* coro.read / coro.write, else blocking calls */
     i64 timeoutMs;      /* per read or write, -1: none */
-    void *impl;         /* the TLS state, later */
+    tls.Conn *impl;     /* the TLS session, null for plain TCP */
     fn(Stream *, u8[]) i64 read;    /* some bytes into buf: > 0, 0 at the end, -1 on an error */
     fn(Stream *, u8[]) bool write;  /* all of data, false on an error */
     fn(Stream *) void close;
@@ -69,6 +69,55 @@ static void Stream.setLoop(bool loop)
     if (loop == self.loop || self.fd < 0) { return; }
     if (loop) { net.setNonBlocking(self.fd); } else { net.setBlocking(self.fd); }
     self.loop = loop;
+}
+
+static i64 tlsRead(Stream *s, u8[] buf)
+{
+    i64 n = s.impl.read(buf, s.timeoutMs);
+    if (n < 0) { os.setErrno(str.contains(s.impl.error(), "timed out") ? libc.ETIMEDOUT : libc.EIO); }
+    return n;
+}
+
+static bool tlsWrite(Stream *s, u8[] data)
+{
+    if (s.impl.write(data, s.timeoutMs) == data.len) { return true; }
+    os.setErrno(str.contains(s.impl.error(), "timed out") ? libc.ETIMEDOUT : libc.EIO);
+    return false;
+}
+
+static void tlsClose(Stream *s)
+{
+    if (!s.impl) { return; }
+    s.impl.close();             /* closes the fd too */
+    s.impl = null;
+    s.fd = -1;
+}
+
+/* Ask the server for TLS (SSLRequest) and do the handshake. false when
+ * the server says it has none ('N'): the stream stays plain. Throws
+ * ERR_TLS when the handshake fails. */
+static bool Stream.startTls(tls.Context *ctx, u8[] host)
+{
+    u8 req[8] = {0, 0, 0, 8, 0x04, 0xD2, 0x16, 0x2F};   /* 80877103 */
+    if (!self.write(self, req[0:8])) { return false; }
+    u8 b[1];
+    /* exactly one byte: anything after it would be unencrypted data
+     * slipped in before the handshake (CVE-2021-23222) */
+    if (self.read(self, b[0:1]) != 1) {
+        throw(ERR_TLS, "pg: the server closed the connection at the TLS request");
+    }
+    if (b[0] != 'S') { return false; }
+    tls.Conn *t;
+    try {
+        t = ctx.connect(self.fd, host);
+    } catch (Error e) {
+        throw(ERR_TLS, "pg: %s", e.message);
+    }
+    self.impl = t;
+    self.read = &tlsRead;
+    self.write = &tlsWrite;
+    self.close = &tlsClose;
+    return true;
 }
 
 /* A plain stream to host:port, or to the Unix socket in directory host

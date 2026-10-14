@@ -17,6 +17,7 @@ pub const i64 ERR_POOL     = 0x70670006;  /* no connection free in time, or the 
 pub const i64 ERR_PROTOCOL = 0x70670007;  /* the server sent something unexpected */
 pub const i64 ERR_ARG      = 0x70670008;  /* a parameter that can't be sent */
 pub const i64 ERR_CLOSED   = 0x70670009;  /* a closed connection, rows or transaction was used */
+pub const i64 ERR_TLS      = 0x7067000A;  /* TLS failed: the handshake, the certificate, or the server has none */
 
 /* SQLSTATE "abcde" as an Error.code */
 pub i64 state(u8[] s)

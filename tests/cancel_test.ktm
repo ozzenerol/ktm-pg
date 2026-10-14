@@ -11,6 +11,7 @@ i64 codeOf(pg.Conn *c, u8[] sql, String *msg = null)
         while (r.next()) { }
     } catch (Error e) {
         if (msg) { msg.append(cstr.view(e.message)); }
+        if (t.verbose()) { printf("\n    (%s)", e.message); }
         return e.code;
     }
     return 0;

@@ -26,7 +26,7 @@ pub void Rows.scan(reflect.Value v, i64 flags = 0)
 {
     reflect.Type *t = v.type;
     if (!t || !v.ptr) { throw(ERR_SCAN, "pg: scan into nothing"); }
-    if (t.kind != reflect.Kind.structType || isDate(t) || isVec(t)) {
+    if (t.kind != reflect.Kind.structType || isDate(t) || isVec(t) || isInterval(t)) {
         if (!self.cols) { throw(ERR_SCAN, "pg: scan: the query returns no columns"); }
         if ((flags & STRICT) && self.cols != 1) {
             throw(ERR_SCAN, "pg: scan: %d columns into one %s", self.cols, t.name);
@@ -102,6 +102,26 @@ static void Rows.scanValue(reflect.Value v, i64 i, i64 flags)
     Column *col = &self.st.cols[i];
     if (isDate(t)) {
         *(date.Date *)v.ptr = self.date(i);
+        return;
+    }
+    if (isInterval(t) && col.oid == INTERVAL) {
+        *(Interval *)v.ptr = self.interval(i);
+        return;
+    }
+    u32 elem = arrayElem(col.oid);
+    if (elem && t.kind != reflect.Kind.string && !(t.kind == reflect.Kind.slice && isByte(t.elem))) {
+        /* an array into a slice, a fixed array or a vec.Vec: through JSON */
+        ad String j = str.new();
+        reflect.Type *et = listElem(t);
+        bool zero = et && et.kind != reflect.Kind.pointer;      /* NULL elements: 0, false, "" */
+        if (!arrayToJson(self.text(i), elem, &j, zero)) {
+            throw(ERR_SCAN, "pg: column %s: \"%s\" isn't an array", col.name, self.text(i));
+        }
+        try {
+            json.decode(j, v);
+        } catch (Error e) {
+            throw(ERR_SCAN, "pg: column %s: %s", col.name, e.message);
+        }
         return;
     }
     switch (t.kind) {

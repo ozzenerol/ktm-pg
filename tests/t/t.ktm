@@ -14,6 +14,13 @@ pub void start(u8[] name)
     printf("Test - %s: ", name);
 }
 
+/* Whether T_VERBOSE is set: print every check */
+pub bool verbose()
+{
+    u8 *v = libc.getenv("T_VERBOSE");
+    return v && v[0];
+}
+
 pub void ok(bool cond, u8 *what)
 {
     gChecks++;
@@ -32,6 +39,7 @@ pub i32 done()
         printf("\n%s: %d of %d checks FAILED\n", gName, gFailed, gChecks);
         return 1;
     }
+    if (verbose()) { printf("\n"); }
     printf("%d/%d passed\n", gChecks, gChecks);
     return 0;
 }

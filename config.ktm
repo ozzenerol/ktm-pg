@@ -1,5 +1,5 @@
 module pg;
-import cstr, libc, mem, str, vec;
+import atomic, cstr, fs, libc, mem, net.tls, str, vec;
 
 /* Where and how to connect: from a URL, then the PG* environment, then
  * the defaults */
@@ -12,6 +12,14 @@ struct Config
     String database;
     i64 connectTimeoutMs;
     bool sslSet;                /* the URL said sslmode */
+    i64 sslMode;                /* SSL_DISABLE .. SSL_VERIFY_FULL */
+    String sslRootCert;         /* the CAs to trust ("system": the system's) */
+    String sslCert;             /* a client certificate, and its key */
+    String sslKey;
+    String sslPassword;
+    i64 channelBinding;         /* CB_PREFER, CB_REQUIRE, CB_DISABLE */
+    i64 tlsLock;
+    tls.Context *tlsCtx;        /* made at the first TLS connection, shared by a pool's */
     vec.Vec<String> params;     /* runtime parameters: key, value, key, value ... */
     /* SCRAM's keys for the last salt and iteration count: a pool's
      * reconnects skip the PBKDF2 (thousands of HMACs). Guarded by
@@ -30,6 +38,11 @@ static void Config.free()
     self.password.free();
     self.database.free();
     self.scramSalt.free();
+    self.sslRootCert.free();
+    self.sslCert.free();
+    self.sslKey.free();
+    self.sslPassword.free();
+    if (self.tlsCtx) { self.tlsCtx.free(); }
     self.params.free();         /* and its Strings */
 }
 
@@ -70,11 +83,66 @@ static void configSet(Config *c, u8[] key, u8[] value)
     }
     if (key.equals("sslmode")) {
         c.sslSet = true;
-        if (value.equals("disable") || value.equals("allow") || value.equals("prefer")) { return; }
-        throw(ERR_CONNECT, "pg: sslmode=%s needs TLS, which ktm-pg doesn't have yet: use sslmode=disable", value);
+        if (value.equals("disable")) { c.sslMode = SSL_DISABLE; }
+        else if (value.equals("allow")) { c.sslMode = SSL_ALLOW; }
+        else if (value.equals("prefer")) { c.sslMode = SSL_PREFER; }
+        else if (value.equals("require")) { c.sslMode = SSL_REQUIRE; }
+        else if (value.equals("verify-ca")) { c.sslMode = SSL_VERIFY_CA; }
+        else if (value.equals("verify-full")) { c.sslMode = SSL_VERIFY_FULL; }
+        else { throw(ERR_CONNECT, "pg: unknown sslmode \"%s\"", value); }
+        return;
     }
+    if (key.equals("sslrootcert")) { c.sslRootCert.free(); c.sslRootCert = str.from(value); return; }
+    if (key.equals("sslcert")) { c.sslCert.free(); c.sslCert = str.from(value); return; }
+    if (key.equals("sslkey")) { c.sslKey.free(); c.sslKey = str.from(value); return; }
+    if (key.equals("sslpassword")) { c.sslPassword.free(); c.sslPassword = str.from(value); return; }
+    if (key.equals("channel_binding")) {
+        if (value.equals("prefer")) { c.channelBinding = CB_PREFER; }
+        else if (value.equals("require")) { c.channelBinding = CB_REQUIRE; }
+        else if (value.equals("disable")) { c.channelBinding = CB_DISABLE; }
+        else { throw(ERR_CONNECT, "pg: unknown channel_binding \"%s\"", value); }
+        return;
+    }
+    if (key.equals("sslnegotiation") || key.equals("sslcompression") || key.equals("gssencmode")) { return; }
     c.params.push(str.from(key));
     c.params.push(str.from(value));
+}
+
+const i64 SSL_DISABLE = 0;
+const i64 SSL_ALLOW = 1;
+const i64 SSL_PREFER = 2;
+const i64 SSL_REQUIRE = 3;
+const i64 SSL_VERIFY_CA = 4;
+const i64 SSL_VERIFY_FULL = 5;
+
+const i64 CB_PREFER = 0;
+const i64 CB_REQUIRE = 1;
+const i64 CB_DISABLE = 2;
+
+/* The TLS context for these settings, made on first use (one per pool) */
+static tls.Context *Config.tlsContext()
+{
+    while (!atomic.cas(&self.tlsLock, 0, 1)) { }
+    defer atomic.store(&self.tlsLock, 0);
+    if (self.tlsCtx) { return self.tlsCtx; }
+    tls.Config tc;
+    mem.set(&tc, 0, sizeof(tls.Config));
+    bool root = self.sslRootCert.len > 0;
+    if (self.sslMode == SSL_VERIFY_FULL) { tc.verify = tls.Verify.full; }
+    else if (self.sslMode == SSL_VERIFY_CA || (self.sslMode == SSL_REQUIRE && root)) { tc.verify = tls.Verify.chain; }
+    else { tc.verify = tls.Verify.none; }
+    if (root && !self.sslRootCert.equals("system")) { tc.caFile = self.sslRootCert; }
+    if (self.sslCert.len) {
+        tc.certFile = self.sslCert;
+        tc.keyFile = self.sslKey;
+        tc.keyPassword = self.sslPassword;
+    }
+    try {
+        self.tlsCtx = tls.client(&tc);
+    } catch (Error e) {
+        throw(ERR_TLS, "pg: TLS settings: %s", e.message);
+    }
+    return self.tlsCtx;
 }
 
 /* A postgres:// or postgresql:// URL, or "" for the environment only */
@@ -164,6 +232,27 @@ static Config configParse(u8[] url)
         }
         u8[] ssl = envOr("PGSSLMODE");
         if (ssl.len && !c.sslSet) { configSet(&c, "sslmode", ssl); }
+        if (!c.sslSet && !ssl.len) { c.sslMode = SSL_PREFER; }   /* libpq's default */
+        u8[] e = envOr("PGSSLROOTCERT");
+        if (e.len && !c.sslRootCert.len) { configSet(&c, "sslrootcert", e); }
+        e = envOr("PGSSLCERT");
+        if (e.len && !c.sslCert.len) { configSet(&c, "sslcert", e); }
+        e = envOr("PGSSLKEY");
+        if (e.len && !c.sslKey.len) { configSet(&c, "sslkey", e); }
+        e = envOr("PGCHANNELBINDING");
+        if (e.len && c.channelBinding == CB_PREFER) { configSet(&c, "channel_binding", e); }
+        /* libpq's files in ~/.postgresql, when they exist */
+        u8[] home = envOr("HOME");
+        if (home.len) {
+            ad String root = str.format("%s/.postgresql/root.crt", home);
+            ad String crt = str.format("%s/.postgresql/postgresql.crt", home);
+            ad String key = str.format("%s/.postgresql/postgresql.key", home);
+            if (!c.sslRootCert.len && fs.exists(root)) { configSet(&c, "sslrootcert", root); }
+            if (!c.sslCert.len && fs.exists(crt) && fs.exists(key)) {
+                configSet(&c, "sslcert", crt);
+                if (!c.sslKey.len) { configSet(&c, "sslkey", key); }
+            }
+        }
     } catch (Error e) {
         c.free();
         throw(e);

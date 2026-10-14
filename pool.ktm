@@ -180,11 +180,12 @@ static void Shard.reap()
 
 /* ---- waiting ---- */
 
-/* Wake w: unpark its coroutine when it is of this thread's loop; a
- * waiter of another thread finds out at its next look (it parks briefly) */
+/* Wake w (from any thread: coro.unpark reaches another thread's loop
+ * too). The caller holds the shard's lock or is its thread, so w is
+ * still waiting and its coroutine alive. A plain thread's waiter polls. */
 static void Shard.wakeWaiter(Waiter *w)
 {
-    if (w.co && self.thread == pthread_self() && coro.inLoop()) { coro.unpark(w.co); }
+    if (w.co) { coro.unpark(w.co); }
 }
 
 static void Shard.enqueue(Waiter *w, bool front)
@@ -253,14 +254,13 @@ static void Pool.wakeOne()
     any.unlock_();
 }
 
-/* Pause until woken, a moment passes, or the deadline. A moment: 5 ms,
- * so budget freed by another thread (which can't wake us) is seen soon. */
+/* Pause until woken or the deadline (a second at most: a safety net) */
 static void Pool.wait(Waiter *w, i64 deadline)
 {
     i64 left = deadline - date.monoMs();
     if (left <= 0) { return; }
     if (w.co) {
-        coro.park(left > 5 ? 5 : left);
+        coro.park(left > 1000 ? 1000 : left);
     } else {
         date.sleepMs(1);
     }

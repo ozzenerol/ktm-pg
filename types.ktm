@@ -23,6 +23,203 @@ pub const u32 TIMESTAMPTZ = 1184;
 pub const u32 NUMERIC = 1700;
 pub const u32 UUID = 2950;
 pub const u32 JSONB = 3802;
+pub const u32 INTERVAL = 1186;
+pub const u32 INET = 869;
+pub const u32 CIDR = 650;
+
+/* An interval as the server keeps it: months, days and microseconds
+ * (a month isn't a fixed number of days, nor a day of hours) */
+pub struct Interval
+{
+    i64 months;
+    i64 days;
+    i64 micros;
+};
+
+/* The element type of an array type, 0 for a type that isn't one */
+static u32 arrayElem(u32 oid)
+{
+    switch (oid) {
+        case 1000: return BOOL;
+        case 1001: return BYTEA;
+        case 1002: return CHAR;
+        case 1003: return NAME;
+        case 1005: return INT2;
+        case 1007: return INT4;
+        case 1009: return TEXT;
+        case 1014: return BPCHAR;
+        case 1015: return VARCHAR;
+        case 1016: return INT8;
+        case 1021: return FLOAT4;
+        case 1022: return FLOAT8;
+        case 1028: return OID;
+        case 1115: return TIMESTAMP;
+        case 1182: return DATE;
+        case 1185: return TIMESTAMPTZ;
+        case 1187: return INTERVAL;
+        case 1231: return NUMERIC;
+        case 2951: return UUID;
+        case 199: return JSON;
+        case 3807: return JSONB;
+        case 1041: return INET;
+        case 651: return CIDR;
+        default: return 0;
+    }
+    return 0;
+}
+
+static bool numericOid(u32 oid)
+{
+    return oid == INT2 || oid == INT4 || oid == INT8 || oid == OID || oid == FLOAT4 || oid == FLOAT8 || oid == NUMERIC;
+}
+
+/* An array's text (the server's {a,"b c",NULL} form) as JSON: numbers
+ * stay numbers, t/f become true/false, NULL null, the rest strings.
+ * Nested arrays nest. false when the text isn't an array. */
+static bool arrayToJson(u8[] s, u32 elem, String *out, bool nullAsZero = false)
+{
+    i64 i = 0;
+    if (i < s.len && s[i] == '[') {         /* bounds: [0:2]={...} */
+        while (i < s.len && s[i] != '=') { i++; }
+        i++;
+    }
+    i64 depth = 0;
+    bool needComma = false;
+    while (i < s.len) {
+        u8 b = s[i];
+        if (b == '{') {
+            if (needComma) { out.appendByte(','); }
+            out.appendByte('[');
+            depth++;
+            needComma = false;
+            i++;
+        } else if (b == '}') {
+            out.appendByte(']');
+            depth--;
+            needComma = true;
+            i++;
+        } else if (b == ',') {
+            i++;
+        } else if (b == '"') {
+            if (needComma) { out.appendByte(','); }
+            out.appendByte('"');
+            i++;
+            while (i < s.len && s[i] != '"') {
+                u8 c = s[i];
+                if (c == '\\' && i + 1 < s.len) { i++; c = s[i]; }
+                if (c == '"' || c == '\\') { out.appendByte('\\'); out.appendByte(c); }
+                else if (c < 0x20) { out.appendFormat("\\u%04x", c); }
+                else { out.appendByte(c); }
+                i++;
+            }
+            out.appendByte('"');
+            i++;
+            needComma = true;
+        } else {
+            i64 st = i;
+            while (i < s.len && s[i] != ',' && s[i] != '}') { i++; }
+            u8[] tok = s[st:i];
+            if (needComma) { out.appendByte(','); }
+            if (tok.equals("NULL")) {
+                if (!nullAsZero) { out.append("null"); }
+                else if (elem == BOOL) { out.append("false"); }
+                else if (numericOid(elem)) { out.append("0"); }
+                else { out.append("\"\""); }
+            }
+            else if (elem == BOOL) {
+                if (tok.equals("t")) { out.append("true"); } else { out.append("false"); }
+            }
+            else if (numericOid(elem) && !tok.equals("NaN") && !tok.equals("Infinity") && !tok.equals("-Infinity")) { out.append(tok); }
+            else {
+                out.appendByte('"');
+                for (auto c : tok) {
+                    if (c == '"' || c == '\\') { out.appendByte('\\'); }
+                    out.appendByte(c);
+                }
+                out.appendByte('"');
+            }
+            needComma = true;
+        }
+        if (depth == 0) { break; }
+    }
+    return depth == 0 && out.len > 0;
+}
+
+/* The innermost element type of a list type (slices, arrays, Vecs of
+ * them), null for a type that isn't one */
+static reflect.Type *listElem(reflect.Type *t)
+{
+    reflect.Type *e = null;
+    while (t) {
+        if (t.kind == reflect.Kind.slice || t.kind == reflect.Kind.array) { e = t.elem; }
+        else if (t.kind == reflect.Kind.structType && str.startsWith(t.name, "vec.Vec<") && t.fields.len == 3) { e = t.fields[0].type.elem; }
+        else { break; }
+        t = e;
+    }
+    return e;
+}
+
+/* The elements of an array value (a slice, a fixed array or a vec.Vec):
+ * where they are and how many; false for a value that isn't a list */
+static bool listOf(reflect.Value v, u8 **at, i64 *n, reflect.Type **elem)
+{
+    reflect.Type *t = v.type;
+    if (t.kind == reflect.Kind.slice) {
+        u8[] *s = v.ptr;            /* any slice: a pointer and a length */
+        *at = s.ptr;
+        *n = s.len;
+        *elem = t.elem;
+        return true;
+    }
+    if (t.kind == reflect.Kind.array) {
+        *at = v.ptr;
+        *n = t.len;
+        *elem = t.elem;
+        return true;
+    }
+    if (t.kind == reflect.Kind.structType && str.startsWith(t.name, "vec.Vec<") && t.fields.len == 3) {
+        *at = *(u8 **)((u8 *)v.ptr + t.fields[0].offset);
+        *n = *(i64 *)((u8 *)v.ptr + t.fields[1].offset);
+        *elem = t.fields[0].type.elem;
+        return true;
+    }
+    return false;
+}
+
+/* A list as the server's array text: {"a","b",NULL} */
+static void arrayText(reflect.Value v, String *out, i64 i)
+{
+    u8 *at;
+    i64 n;
+    reflect.Type *elem;
+    listOf(v, &at, &n, &elem);
+    out.appendByte('{');
+    for (i64 k = 0; k < n; k++) {
+        if (k) { out.appendByte(','); }
+        reflect.Value e = reflect.__value(at + k * elem.size, elem);
+        reflect.Value d = argValue(e);
+        u8 *a2;
+        i64 n2;
+        reflect.Type *t2;
+        if (d.type && d.ptr && !isByte(d.type.elem) && listOf(d, &a2, &n2, &t2)) {
+            arrayText(d, out, i);   /* nested: a multidimensional array */
+            continue;
+        }
+        ad String s = str.new();
+        if (!argText(e, &s, i)) {
+            out.append("NULL");
+            continue;
+        }
+        out.appendByte('"');
+        for (i64 j = 0; j < s.len; j++) {
+            u8 c = s[j];
+            if (c == '"' || c == '\\') { out.appendByte('\\'); }
+            out.appendByte(c);
+        }
+        out.appendByte('"');
+    }
+    out.appendByte('}');
+}
 
 /* scan flags */
 pub const i64 STRICT = 1;   /* a field with no column, a column with no field, or NULL into a non-pointer: ERR_SCAN */
@@ -37,7 +234,7 @@ static i16 resultFormat(u32 oid)
 {
     switch (oid) {
         case BOOL: case BYTEA: case INT8: case INT2: case INT4: case OID:
-        case FLOAT4: case FLOAT8: case DATE: case TIMESTAMP: case TIMESTAMPTZ: case UUID:
+        case FLOAT4: case FLOAT8: case DATE: case TIMESTAMP: case TIMESTAMPTZ: case UUID: case INTERVAL:
             return 1;
         default:
             return 0;
@@ -130,6 +327,11 @@ static bool isByte(reflect.Type *t)
     return t && t.kind == reflect.Kind.int && t.size == 1;
 }
 
+static bool isInterval(reflect.Type *t)
+{
+    return t && t.kind == reflect.Kind.structType && str.endsWith(t.name, "Interval") && t.size == sizeof(Interval);
+}
+
 static bool isDate(reflect.Type *t)
 {
     return t && t.name.equals("date.Date");     /* an i64 struct: its kind is int */
@@ -191,6 +393,8 @@ static i16 paramFormat(u32 oid, reflect.Value v)
         }
         case TIMESTAMP: case TIMESTAMPTZ: case DATE:
             return isDate(t) ? 1 : 0;
+        case INTERVAL:
+            return isInterval(t) ? 1 : 0;
         default:
             return 0;
     }
@@ -298,6 +502,14 @@ static void Conn.putArg(u32 oid, reflect.Value v, i64 i)
                 self.put32(floorDiv(us, DAY_US) - PG_EPOCH_DAYS);
                 return;
             }
+            case INTERVAL: {
+                Interval *iv = v.ptr;
+                self.put32(16);
+                self.putBe64(iv.micros);
+                self.put32(iv.days);
+                self.put32(iv.months);
+                return;
+            }
         }
     }
     if (isDate(t)) {
@@ -308,6 +520,21 @@ static void Conn.putArg(u32 oid, reflect.Value v, i64 i)
     }
     u8[] b;
     if (argBytes(v, &b)) { self.putText(b); return; }
+    u8 *la;
+    i64 ln;
+    reflect.Type *le;
+    if (arrayElem(oid) && listOf(v, &la, &ln, &le)) {   /* a list to an array parameter */
+        ad String s = str.new();
+        arrayText(v, &s, i);
+        self.putText(s);
+        return;
+    }
+    if (isInterval(t)) {
+        u8 buf[96];
+        i64 n = formatInterval(*(Interval *)v.ptr, buf);
+        self.putText(buf[0:n]);
+        return;
+    }
     switch (t.kind) {
         case reflect.Kind.int:
             self.putDecimal(reflect.getInt(v));
@@ -333,6 +560,49 @@ static void Conn.putArg(u32 oid, reflect.Value v, i64 i)
         return;
     }
     throw(ERR_ARG, "pg: parameter $%d: a %s can't be sent", i + 1, t.name);
+}
+
+/* v as text, the way a parameter in text format is sent (COPY uses it):
+ * appended to out; false for NULL (nothing appended) */
+static bool argText(reflect.Value v, String *out, i64 i)
+{
+    v = argValue(v);
+    reflect.Type *t = v.type;
+    if (!t || !v.ptr || (t.kind == reflect.Kind.pointer && !*(void **)v.ptr)) { return false; }
+    if (isDate(t)) {
+        u8 buf[40];
+        i64 n = formatTimestamp(microsFromDate(*(date.Date *)v.ptr), buf, true);
+        out.append(buf[0:n]);
+        return true;
+    }
+    u8[] b;
+    if (argBytes(v, &b)) { out.append(b); return true; }
+    switch (t.kind) {
+        case reflect.Kind.int:
+            out.appendFormat("%lld", reflect.getInt(v));
+            return true;
+        case reflect.Kind.boolean:
+            out.appendByte(reflect.getInt(v) ? 't' : 'f');
+            return true;
+        case reflect.Kind.float: {
+            u8 buf[40];
+            i64 n = formatFloat(reflect.getFloat(v), buf);
+            out.append(buf[0:n]);
+            return true;
+        }
+        case reflect.Kind.enumType:
+            out.append(reflect.nameOf(t, reflect.getInt(v)));
+            return true;
+        default:
+            break;
+    }
+    if (t.kind == reflect.Kind.structType || t.kind == reflect.Kind.slice || t.kind == reflect.Kind.array) {
+        ad String j = json.encode(v);
+        out.append(j);
+        return true;
+    }
+    throw(ERR_ARG, "pg: value %d: a %s can't be sent", i + 1, t.name);
+    return false;
 }
 
 /* ---- formatting values as text ---- */
@@ -368,6 +638,31 @@ static i64 formatTimestamp(i64 us, u8 *buf, bool tz)
         while (buf[n - 1] == '0') { n--; }
     }
     if (tz) { buf[n++] = '+'; buf[n++] = '0'; buf[n++] = '0'; }
+    buf[n] = 0;
+    return n;
+}
+
+/* An interval as the server writes it (IntervalStyle postgres):
+ * 1 year 2 mons 3 days 04:05:06.5 */
+static i64 formatInterval(Interval iv, u8 *buf)
+{
+    i64 n = 0;
+    i64 years = iv.months / 12, mons = iv.months % 12;
+    if (years) { n += libc.snprintf(buf + n, 96 - n, "%lld year%s ", years, years == 1 ? "" : "s"); }
+    if (mons) { n += libc.snprintf(buf + n, 96 - n, "%lld mon%s ", mons, mons == 1 ? "" : "s"); }
+    if (iv.days) { n += libc.snprintf(buf + n, 96 - n, "%lld day%s ", iv.days, iv.days == 1 ? "" : "s"); }
+    if (iv.micros || !n) {
+        u64 us = iv.micros < 0 ? (u64)(0 - iv.micros) : (u64)iv.micros;
+        if (iv.micros < 0) { buf[n++] = '-'; }
+        n += libc.snprintf(buf + n, 96 - n, "%02llu:%02llu:%02llu", us / 3600000000, us / 60000000 % 60, us / 1000000 % 60);
+        u64 frac = us % 1000000;
+        if (frac) {
+            n += libc.snprintf(buf + n, 96 - n, ".%06llu", frac);
+            while (buf[n - 1] == '0') { n--; }
+        }
+    } else {
+        n--;                        /* the space after the last part */
+    }
     buf[n] = 0;
     return n;
 }
@@ -571,6 +866,8 @@ pub u8[] Rows.text(i64 i)
                            : binMicros(DATE, b) / DAY_US, buf);
         case UUID:
             n = formatUuid(b, buf);
+        case INTERVAL:
+            n = formatInterval(self.interval(i), buf);
         default:
             return b;
     }
@@ -599,6 +896,23 @@ pub i64 Rows.micros(i64 i)
     }
     throw(ERR_SCAN, "pg: column %s: a %s isn't a timestamp", col.name, typeName(col.oid));
     return 0;
+}
+
+/* Column i (an interval) as a pg.Interval: zero for NULL */
+pub Interval Rows.interval(i64 i)
+{
+    Interval iv;
+    mem.set(&iv, 0, sizeof(Interval));
+    u8[] b;
+    Column *col;
+    if (!self.value(i, &b, &col)) { return iv; }
+    if (col.oid != INTERVAL || !col.format || b.len != 16) {
+        throw(ERR_SCAN, "pg: column %s: a %s isn't an interval", col.name, typeName(col.oid));
+    }
+    iv.micros = (i64)bytesBe64(b);
+    iv.days = (i32)bytesBe32(b[8:12]);
+    iv.months = (i32)bytesBe32(b[12:16]);
+    return iv;
 }
 
 /* Column i (a timestamp, timestamptz or date) as a date.Date (UTC) */

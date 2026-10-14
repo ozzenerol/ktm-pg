@@ -20,10 +20,11 @@ for f in "$dir"/*_test.ktm; do
     for v in $versions; do
         for mode in aot jit; do
             total=$((total + 1))
+            docker unpause ktm-pg-$v >/dev/null 2>&1    # a test that died while it had paused the server
             if [ $mode = aot ]; then
-                out=$(cd "$work" && PGVER=$v T_VERBOSE=1 timeout 120 "$work/$name" 2>&1)
+                out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 "$work/$name" 2>&1)
             else
-                out=$(cd "$work" && PGVER=$v T_VERBOSE=1 timeout 120 ktm -jit -Memsafe "$f" 2>&1)
+                out=$(cd "$dir" && PGVER=$v T_VERBOSE=1 timeout 120 ktm -jit -Memsafe "$f" 2>&1)
             fi
             code=$?
             line=$(printf '%s\n' "$out" | grep -ao '[0-9]*/[0-9]* passed$' | tail -1)
