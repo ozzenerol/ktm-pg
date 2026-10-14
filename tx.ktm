@@ -5,7 +5,7 @@ import reflect, str;
  * statements on it, and end it with commit() or rollback(). rollback()
  * after commit() does nothing, so `defer tx.rollback();` right after
  * begin() covers every way out. */
-pub struct Tx
+pub struct Tx : Db
 {
     private Conn *c;
     private bool done;
@@ -42,6 +42,7 @@ pub Tx Conn.begin(u8[] mode = "")
         self.simpleTag("BEGIN", "BEGIN");
     }
     Tx tx;
+    tx.open = &txOpen;
     tx.c = self;
     tx.done = false;
     tx.own = false;
@@ -92,6 +93,12 @@ pub void Tx.rollback()
         } catch { }
     }
     self.end_();
+}
+
+static Rows txOpen(Db *db, u8[] sql, reflect.Value[] args)
+{
+    Tx *tx = db;
+    return tx.conn_().queryArgs(sql, args);
 }
 
 /* The connection the transaction runs on */

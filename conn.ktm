@@ -1,9 +1,16 @@
 module pg;
 import date, hash, libc, mem, os, reflect, str;
 
+/* What a Conn, a Tx and a Pool have in common: pg.queryAll and
+ * pg.queryOne take any of them as a Db * */
+pub struct Db
+{
+    private fn(Db *, u8[], reflect.Value[]) Rows open;
+};
+
 /* A connection to the server. One coroutine uses it at a time; share
  * connections through a Pool. */
-pub struct Conn
+pub struct Conn : Db
 {
     private Stream s;
     private u8 *in;             /* received bytes: in[inStart:inEnd] not parsed yet */
@@ -214,16 +221,30 @@ static u8[] cstrAt(u8[] b, i64 at)
     return b[at:i];
 }
 
+/* Sign-extend through a variable: a (i32) cast of a u32 doesn't (ktm
+ * rc/0.20.0, reported) */
+static i64 sx32(u32 v)
+{
+    i32 x = v;
+    return x;
+}
+
+static i64 sx16(u16 v)
+{
+    i16 x = v;
+    return x;
+}
+
 static i64 be32At(u8[] b, i64 at)
 {
     if (at + 4 > b.len) { throw(ERR_PROTOCOL, "pg: a message too short"); }
-    return (i32)((u32)b.ptr[at] << 24 | (u32)b.ptr[at + 1] << 16 | (u32)b.ptr[at + 2] << 8 | b.ptr[at + 3]);
+    return sx32((u32)b.ptr[at] << 24 | (u32)b.ptr[at + 1] << 16 | (u32)b.ptr[at + 2] << 8 | b.ptr[at + 3]);
 }
 
 static i64 be16At(u8[] b, i64 at)
 {
     if (at + 2 > b.len) { throw(ERR_PROTOCOL, "pg: a message too short"); }
-    return (i16)((u16)b.ptr[at] << 8 | b.ptr[at + 1]);
+    return sx16((u16)b.ptr[at] << 8 | b.ptr[at + 1]);
 }
 
 /* An ErrorResponse's fields as an error: its SQLSTATE as the code and a
@@ -296,6 +317,7 @@ pub Conn *connect(u8[] url = "")
 static Conn *connectConfig(Config *cfg)
 {
     Conn *c = mem.allocZero(sizeof(Conn));
+    c.open = &connOpen;
     c.s.fd = -1;
     if (!streamDial(&c.s, cfg.host, cfg.port, cfg.connectTimeoutMs)) {
         i32 err = os.errno();
@@ -656,7 +678,12 @@ static void Conn.bindExecute(Stmt *st, reflect.Value[] args)
     self.put16(args.len);
     for (i64 i = 0; i < args.len; i++) { self.put16(paramFormat(st.paramOids[i], args[i])); }
     self.put16(args.len);
-    for (i64 i = 0; i < args.len; i++) { self.putArg(st.paramOids[i], args[i], i); }
+    try {
+        for (i64 i = 0; i < args.len; i++) { self.putArg(st.paramOids[i], args[i], i); }
+    } catch (Error e) {
+        self.outLen = 0;            /* nothing of the Bind goes out */
+        throw(e);
+    }
     self.put16(st.ncols);
     for (i64 i = 0; i < st.ncols; i++) { self.put16(st.cols[i].format); }
     self.end();
@@ -739,6 +766,12 @@ pub Rows Conn.queryArgs(u8[] sql, reflect.Value[] args)
 }
 
 /* queryArgs with the parameters $1, $2 ... as arguments of any type */
+static Rows connOpen(Db *db, u8[] sql, reflect.Value[] args)
+{
+    Conn *c = db;
+    return c.queryArgs(sql, args);
+}
+
 pub Rows Conn.query(u8[] sql, any ...args)
 {
     return self.queryArgs(sql, args);

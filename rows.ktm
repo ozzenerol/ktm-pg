@@ -1,5 +1,5 @@
 module pg;
-import mem;
+import mem, reflect;
 
 /* The rows of a query, read one at a time from the connection as they
  * come. The values of a row are views valid until the next call to
@@ -14,6 +14,9 @@ pub struct Rows
     private bool done;
     private bool row;           /* a row is there to read */
     private i64 count;
+    private u8 *fmt;            /* 48 bytes per column: text() of a binary value */
+    private i32 *fieldOf;       /* scan: per column, the field it fills (-1: none) */
+    private reflect.Type *scanType;
 };
 
 static void Rows.finish()
@@ -78,7 +81,11 @@ pub void Rows.free()
         } catch { }
     }
     mem.free(self.off);
+    mem.free(self.fmt);
+    mem.free(self.fieldOf);
     self.off = null;
+    self.fmt = null;
+    self.fieldOf = null;
     self.done = true;
     self.row = false;
 }

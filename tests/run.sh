@@ -3,14 +3,11 @@
 # version: 14 15 16 17 18 (PGVER=17 tests/run.sh for one). Starts the
 # containers with pg-up.sh. Exit code 1 when anything failed.
 dir=$(cd "$(dirname "$0")" && pwd)
-root=$(dirname "$dir")
 versions=${PGVER:-"14 15 16 17 18"}
 PGVER="$versions" "$dir/pg-up.sh" || exit 1
-# import pg finds the package through a link named pg until import "github.com/..." works
+# the tests import "github.com/ozzenerol/ktm-pg": tests/ktm.mod points it at this checkout
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
-ln -s "$root" "$work/pg"
-export KTM_PATH="$work${KTM_PATH:+:$KTM_PATH}"
 ulimit -v 4000000
 fail=0
 total=0

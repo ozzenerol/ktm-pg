@@ -1,4 +1,5 @@
-import coro, cstr, date, libc, pg, reflect, str, t;
+import "github.com/ozzenerol/ktm-pg";
+import coro, cstr, date, libc, reflect, str, t;
 
 /* The wire protocol: start-up, every auth method, simple and extended
  * queries, errors, the statement cache, and coroutines */
