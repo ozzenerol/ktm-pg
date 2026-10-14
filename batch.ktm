@@ -173,18 +173,24 @@ pub i64[] Conn.execBatch(Batch *b)
     i64 k = 0;
     bool failed = false;
     ServerError err;
-    while (true) {
-        u8 t = self.recv();
-        if (t == 'C') {
-            if (k < b.n) { counts[k] = tagCount(cstrAt(self.msg, 0)); }
-            k++;
-        } else if (t == 'E' && !failed) {
-            err = self.serverErr();
-            failed = true;
-        } else if (t == 'Z') {
-            self.txStatus = self.msg.len ? self.msg[0] : 'I';
-            break;
+    try {
+        while (true) {
+            u8 t = self.recv();
+            if (t == 'C') {
+                if (k < b.n) { counts[k] = tagCount(cstrAt(self.msg, 0)); }
+                k++;
+            } else if (t == 'E' && !failed) {
+                err = self.serverErr();
+                failed = true;
+            } else if (t == 'Z') {
+                self.txStatus = self.msg.len ? self.msg[0] : 'I';
+                break;
+            }
         }
+    } catch (Error e) {
+        mem.free(counts);
+        if (failed) { err.message.free(); }
+        self.rethrow(&e);
     }
     if (failed) {
         mem.free(counts);

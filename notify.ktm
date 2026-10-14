@@ -29,11 +29,13 @@ struct Note
 /* A NotificationResponse just read: queue it */
 static void Conn.queueNote()
 {
-    Note *e = mem.allocZero(sizeof(Note));
-    e.n.pid = be32At(self.msg, 0);
+    i64 pid = be32At(self.msg, 0);             /* parse it all before allocating */
     u8[] channel = cstrAt(self.msg, 4);
+    u8[] payload = cstrAt(self.msg, 4 + channel.len + 1);
+    Note *e = mem.allocZero(sizeof(Note));
+    e.n.pid = pid;
     e.n.channel = str.from(channel);
-    e.n.payload = str.from(cstrAt(self.msg, 4 + channel.len + 1));
+    e.n.payload = str.from(payload);
     if (self.noteTail) { self.noteTail.next = e; } else { self.noteHead = e; }
     self.noteTail = e;
 }
@@ -130,7 +132,10 @@ pub bool Conn.waitNotification(Notification *n, i64 ms = -1)
             }
         }
         u8 t = self.readRaw();
-        if (t == 'A') { self.queueNote(); continue; }
+        if (t == 'A') {
+            try { self.queueNote(); } catch (Error e) { self.rethrow(&e); }
+            continue;
+        }
         if (t == 'S' || t == 'N') { continue; }
         if (t == 'E') {
             ServerError e = serverError(self.msg);

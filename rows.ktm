@@ -44,36 +44,38 @@ pub bool Rows.next()
 {
     if (self.done) { return false; }
     Conn *c = self.c;
-    if (!self.started) {
-        self.started = true;
-        try {
+    try {
+        if (!self.started) {
+            self.started = true;
             c.turn(self.req);
-        } catch (Error e) {
-            self.finish();
-            throw(e);
         }
+        return self.read();
+    } catch (Error e) {
+        if (!self.done) { self.finish(); }
+        if (e.code == ERR_PROTOCOL || e.code == ERR_BOUNDS) { c.rethrow(&e); }
+        throw(e);
     }
+    return false;
+}
+
+static bool Rows.read()
+{
+    Conn *c = self.c;
     while (true) {
-        u8 t;
-        try {
-            t = c.recv();
-        } catch (Error e) {
-            self.finish();
-            throw(e);
-        }
+        u8 t = c.recv();
         if (t == 'D') {
             u8[] m = c.msg;
             i64 n = be16At(m, 0);
-            if (n != self.cols) { self.finish(); throw(ERR_PROTOCOL, "pg: a row of %d columns, expected %d", n, self.cols); }
+            if (n != self.cols) { throw(ERR_PROTOCOL, "pg: a row of %d columns, expected %d", n, self.cols); }
             i64 at = 2;
             for (i64 i = 0; i < n; i++) {
                 i64 len = be32At(m, at);
                 at += 4;
+                if (len < -1 || (len > 0 && at + len > m.len)) { throw(ERR_PROTOCOL, "pg: a value longer than its row"); }
                 self.off[i * 2] = at;
                 self.off[i * 2 + 1] = len;
                 if (len > 0) { at += len; }
             }
-            if (at > m.len) { self.finish(); throw(ERR_PROTOCOL, "pg: a row longer than its message"); }
             self.row = true;
             return true;
         }

@@ -133,14 +133,7 @@ pub i64 CopyIn.end()
     c.begin('c');
     c.end();
     c.flush();
-    i64 n = 0;
-    while (true) {
-        u8 t = c.recv();
-        if (t == 'C') { n = tagCount(cstrAt(c.msg, 0)); }
-        else if (t == 'E') { c.throwServerError(); }
-        else if (t == 'Z') { c.txStatus = c.msg.len ? c.msg[0] : 'I'; break; }
-    }
-    return n;
+    return c.readCount();
 }
 
 /* Gives up the COPY: nothing of it stays. Does nothing after end(). */
@@ -198,7 +191,10 @@ pub bool CopyOut.next()
             self.data = c.msg;
             return true;
         }
-        if (t == 'C') { self.count = tagCount(cstrAt(c.msg, 0)); continue; }
+        if (t == 'C') {
+            try { self.count = tagCount(cstrAt(c.msg, 0)); } catch (Error e) { self.finish(); c.rethrow(&e); }
+            continue;
+        }
         if (t == 'Z') {
             c.txStatus = c.msg.len ? c.msg[0] : 'I';
             self.finish();

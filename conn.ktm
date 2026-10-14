@@ -93,6 +93,9 @@ struct Column
 
 const i64 STMT_CACHE = 256;
 
+/* SCRAM iterations the client does at most (the server's default: 4096) */
+const i64 SCRAM_MAX_ITER = 2000000;
+
 /* After a CancelRequest, the server has this long to answer before the
  * connection is given up */
 const i64 CANCEL_GRACE_MS = 5000;
@@ -234,7 +237,15 @@ static void Conn.fill(i64 n)
     if (n > self.inCap) {
         i64 cap = self.inCap ? self.inCap : IN_FIRST;
         while (cap < n) { cap *= 2; }
-        self.in = mem.realloc(self.in, cap);
+        u8 *p = mem.realloc(self.in, cap);
+        if (!p) {
+            /* the length a broken or hostile server announced */
+            self.dead = true;
+            self.s.close(&self.s);
+            self.wakeAll();
+            throw(ERR_PROTOCOL, "pg: no memory for a message of %d bytes", n);
+        }
+        self.in = p;
         self.inCap = cap;
     }
     while (self.inEnd - self.inStart < n) {
@@ -354,9 +365,27 @@ static u8 Conn.recv()
 /* The NUL-terminated string at b[at:] */
 static u8[] cstrAt(u8[] b, i64 at)
 {
+    if (at < 0 || at >= b.len) { throw(ERR_PROTOCOL, "pg: a message too short"); }
     i64 i = at;
     while (i < b.len && b.ptr[i]) { i++; }
+    if (i == b.len) { throw(ERR_PROTOCOL, "pg: a string without its end in a message"); }
     return b[at:i];
+}
+
+/* An error while reading answers: a malformed message leaves the stream
+ * out of step, so the connection is closed (ERR_PROTOCOL, with any
+ * bounds error of the parsing turned into one) */
+static void Conn.rethrow(Error *e)
+{
+    if (e.code == ERR_PROTOCOL || e.code == ERR_BOUNDS) {
+        if (!self.dead) {
+            self.dead = true;
+            self.s.close(&self.s);
+            self.wakeAll();
+        }
+        if (e.code == ERR_BOUNDS) { throw(ERR_PROTOCOL, "pg: a malformed message from the server: %s", e.message); }
+    }
+    throw(*e);
 }
 
 static i64 be32At(u8[] b, i64 at)
@@ -472,6 +501,7 @@ static Conn *connectConfig(Config *cfg)
         c.startup(cfg);
     } catch (Error e) {
         c.release_();
+        if (e.code == ERR_BOUNDS) { throw(ERR_PROTOCOL, "pg: a malformed message from the server: %s", e.message); }
         throw(e);
     }
     return c;
@@ -598,6 +628,7 @@ static void Conn.auth(Config *cfg, Scram *sc)
         return;
     }
     if (kind == 10) {                /* SASL: the mechanisms */
+        if (sc.nonce.len) { throw(ERR_PROTOCOL, "pg: the server started SASL twice"); }
         bool scram = false, plus = false;
         i64 at = 4;
         while (at < self.msg.len && self.msg[at]) {
@@ -663,8 +694,12 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
         else if (str.startsWith(part, "s=")) { s = part[2:]; }
         else if (str.startsWith(part, "i=")) { str.toInt(part[2:], &iter); }
     }
-    if (!str.startsWith(r, sc.nonce) || !s.len || iter <= 0) {
+    if (!str.startsWith(r, sc.nonce) || r.len == sc.nonce.len || !s.len || iter <= 0) {
         throw(ERR_AUTH, "pg: a bad SCRAM server-first message");
+    }
+    if (iter > SCRAM_MAX_ITER) {
+        /* a hostile server could keep the client hashing for hours */
+        throw(ERR_AUTH, "pg: the server asks for %d SCRAM iterations, more than %d", iter, SCRAM_MAX_ITER);
     }
     ad String salt = str.new();
     if (!base64Decode(s, &salt)) { throw(ERR_AUTH, "pg: a bad SCRAM salt"); }
@@ -986,8 +1021,11 @@ static Stmt *Conn.prepare(u8[] sql, Req *r)
             if (failed) { continue; }
             if (t == 'E') { err = self.serverErr(); failed = true; }
             else if (t == 't') {
-                st.nparams = be16At(self.msg, 0);
-                st.paramOids = mem.alloc(4 * (st.nparams + 1));
+                i64 np = be16At(self.msg, 0);
+                if (np < 0) { throw(ERR_PROTOCOL, "pg: a ParameterDescription of %d parameters", np); }
+                mem.free(st.paramOids);
+                st.paramOids = mem.allocZero(4 * (np + 1));
+                st.nparams = np;
                 for (i64 i = 0; i < st.nparams; i++) { st.paramOids[i] = be32At(self.msg, 2 + i * 4); }
             } else if (t == 'T') {
                 self.readColumns(st);
@@ -998,7 +1036,7 @@ static Stmt *Conn.prepare(u8[] sql, Req *r)
         if (failed) { err.message.free(); }
         self.leave(r);
         self.removeStmt(st);
-        throw(e);
+        self.rethrow(&e);
     }
     self.leave(r);
     if (failed) {
@@ -1015,8 +1053,14 @@ static Stmt *Conn.prepare(u8[] sql, Req *r)
 static void Conn.readColumns(Stmt *st)
 {
     u8[] m = self.msg;
-    st.ncols = be16At(m, 0);
-    st.cols = mem.allocZero(sizeof(Column) * (st.ncols + 1));
+    for (i64 i = 0; i < st.ncols; i++) { st.cols[i].name.free(); }   /* a second one: the server's mistake */
+    mem.free(st.cols);
+    st.cols = null;
+    st.ncols = 0;
+    i64 n = be16At(m, 0);
+    if (n < 0) { throw(ERR_PROTOCOL, "pg: a RowDescription of %d columns", n); }
+    st.cols = mem.allocZero(sizeof(Column) * (n + 1));
+    st.ncols = n;
     i64 at = 2;
     for (i64 i = 0; i < st.ncols; i++) {
         u8[] name = cstrAt(m, at);
@@ -1084,12 +1128,22 @@ pub i64 Conn.execArgs(u8[] sql, reflect.Value[] args)
     defer st.refs--;
     self.bindExecute(st, args);
     self.turn(&r);
+    return self.readCount();
+}
+
+/* Answers up to ReadyForQuery: the count of the last CommandComplete */
+static i64 Conn.readCount()
+{
     i64 n = 0;
-    while (true) {
-        u8 t = self.recv();
-        if (t == 'C') { n = tagCount(cstrAt(self.msg, 0)); }
-        else if (t == 'E') { self.throwServerError(); }
-        else if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
+    try {
+        while (true) {
+            u8 t = self.recv();
+            if (t == 'C') { n = tagCount(cstrAt(self.msg, 0)); }
+            else if (t == 'E') { self.throwServerError(); }
+            else if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
+        }
+    } catch (Error e) {
+        self.rethrow(&e);
     }
     return n;
 }
@@ -1112,14 +1166,7 @@ pub i64 Conn.execScript(u8[] sql)
     self.end();
     self.flush();
     self.turn(&r);
-    i64 n = 0;
-    while (true) {
-        u8 t = self.recv();
-        if (t == 'C') { n = tagCount(cstrAt(self.msg, 0)); }
-        else if (t == 'E') { self.throwServerError(); }
-        else if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
-    }
-    return n;
+    return self.readCount();
 }
 
 /* Runs a query; read its rows with rows.next() and free them with

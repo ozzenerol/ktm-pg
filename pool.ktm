@@ -531,11 +531,7 @@ pub void Conn.ping()
     self.end();
     self.flush();
     self.turn(&r);
-    while (true) {
-        u8 t = self.recv();
-        if (t == 'E') { self.throwServerError(); }
-        if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
-    }
+    self.readCount();
 }
 
 /* Checks the server can be reached: takes a connection and pings it */

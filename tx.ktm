@@ -25,11 +25,15 @@ static bool Conn.simpleTag(u8[] sql, u8[] want)
     self.flush();
     self.turn(&r);
     bool same = false;
-    while (true) {
-        u8 t = self.recv();
-        if (t == 'C') { same = cstrAt(self.msg, 0).equals(want); }
-        else if (t == 'E') { self.throwServerError(); }
-        else if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
+    try {
+        while (true) {
+            u8 t = self.recv();
+            if (t == 'C') { same = cstrAt(self.msg, 0).equals(want); }
+            else if (t == 'E') { self.throwServerError(); }
+            else if (t == 'Z') { self.txStatus = self.msg.len ? self.msg[0] : 'I'; break; }
+        }
+    } catch (Error e) {
+        self.rethrow(&e);
     }
     return same;
 }
