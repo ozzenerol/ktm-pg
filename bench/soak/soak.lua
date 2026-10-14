@@ -1,5 +1,8 @@
--- wrk mix for the soak test: 80% GET /users/{id}, 10% GET /users,
--- 8% POST /users (a new email each time), 2% DELETE /users/{id}.
+-- wrk mix for the soak test: 85% GET /users/{id}, 9% GET /users,
+-- 5% POST /users with one of the 10000 seeded emails (a 409: the unique
+-- violation path, a failed insert each time), 1% DELETE /users/{id} of an
+-- id past the seeded ones (a 404). The table stays at its 10000 rows, so
+-- the GETs find their user, for any length of run.
 -- Prints one JSON line at the end: requests, non-2xx/404/409 statuses, socket errors.
 local counter = 0
 local thread_id = 0
@@ -18,15 +21,15 @@ end
 function request()
   counter = counter + 1
   local r = math.random(100)
-  if r <= 80 then
+  if r <= 85 then
     return wrk.format("GET", "/users/" .. math.random(10000))
-  elseif r <= 90 then
+  elseif r <= 94 then
     return wrk.format("GET", "/users")
-  elseif r <= 98 then
-    local body = string.format('{"name":"soak","email":"t%d-%d-%d@x"}', tid, os.time(), counter)
+  elseif r <= 99 then
+    local body = string.format('{"name":"soak","email":"u%d@x"}', math.random(10000))
     return wrk.format("POST", "/users", {["Content-Type"] = "application/json"}, body)
   else
-    return wrk.format("DELETE", "/users/" .. math.random(10000, 2000000))
+    return wrk.format("DELETE", "/users/" .. math.random(10001, 20000))
   end
 end
 

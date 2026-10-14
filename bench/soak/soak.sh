@@ -19,10 +19,11 @@ SPID=$!
 sleep 1
 HZ=$(getconf CLK_TCK)
 for m in $(seq $MINUTES); do
-    if [ $m -eq $RESTART_AT ]; then ( sleep 20; pg_ctlcluster 17 main restart ) & fi
+    if [ $m -eq $RESTART_AT ]; then ( sleep 20; taskset -c 7,15,8,14 pg_ctlcluster 17 main restart ) & fi
     t0=$(awk '{print $14 + $15}' /proc/$SPID/stat)
     line=$(taskset -c 3,11 wrk -t2 -c64 -d60s --timeout 5s -s soak.lua http://127.0.0.1:$PORT/ 2>/dev/null | grep '^{')
     t1=$(awk '{print $14 + $15}' /proc/$SPID/stat 2>/dev/null || echo $t0)
     rss=$(awk '/VmRSS/{print $2}' /proc/$SPID/status 2>/dev/null || echo 0)
-    echo "{\"minute\":$m,${line#\{},\"rss_kb\":$rss,\"cpu\":$(echo "($t1 - $t0) / $HZ / 60" | bc -l | cut -c1-5)}" | sed 's/,}/}/'
+    line=${line#\{}
+    echo "{\"minute\":$m,${line%\}},\"rss_kb\":$rss,\"cpu\":$(echo "($t1 - $t0) / $HZ / 60" | bc -l | cut -c1-5)}"
 done

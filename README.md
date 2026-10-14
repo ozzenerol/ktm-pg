@@ -271,6 +271,27 @@ chain; `verify-full` the chain and the host name. With TLS, SCRAM uses channel b
 pg.connect("postgres://app@db.example.com/app?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem");
 ```
 
+## Performance
+
+Against Go's pgx (v5, pgxpool) on the same queries, both clients pinned to the same two CPUs
+and Postgres 17 to six others (`bench/`: `lxc.sh` runs it, `table.py` prints this; median of
+3 x 10 s, 2026-10-14):
+
+| query | concurrent | ktm-pg ops/s | pgx ops/s | ktm-pg / pgx | client CPU per query, ktm-pg / pgx |
+| --- | --- | --- | --- | --- | --- |
+| select a row by key | 1 | 35,894 | 29,999 | 1.20x | 12.8 / 26.1 us |
+| select a row by key | 64 | 162,569 | 144,844 | 1.12x | 9.4 / 11.6 us |
+| insert | 1 | 1,543 | 1,513 | 1.02x | 18.8 / 47.0 us |
+| insert | 64 | 50,281 | 51,050 | 0.98x | 10.2 / 13.5 us |
+| select 1000 rows into structs | 1 | 3,279 | 3,998 | 0.82x | 255 / 204 us |
+| select 1000 rows into structs | 64 | 8,267 | 9,596 | 0.86x | 242 / 185 us |
+
+Point queries, the bulk of a REST API's work, are faster with about half the client CPU;
+inserts wait for the server's fsync either way. pgx still wins on big results scanned into
+structs: each row's Strings are a malloc and later a free here, while Go's allocator and
+garbage collector make the same allocations cheaper (and its collector runs on the second CPU).
+Reading such results with `rows.text(i)` views, which allocate nothing, avoids that cost.
+
 ## Errors
 
 Everything throws. A server error's `e.code` is its SQLSTATE, so
