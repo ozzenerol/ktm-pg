@@ -12,6 +12,7 @@ import "github.com/ozzenerol/ktm-pg";      // the package is named pg
 - Connect with a URL and the `PG*` environment, like libpq.
 - `exec`, `query`, and `pg.queryAll<T>` / `pg.queryOne<T>` that scan rows into structs;
   `pg.queryResult<T>` for big results, freed at once.
+- `COPY` in and out, and binary `COPY` from structs (`c.copyInto<T>(table)`).
 - Transactions, a pool safe across `coro.serve` / `net.http` threads, query timeouts with
   server-side cancel, automatic pipelining.
 - TLS (`sslmode` like libpq), SCRAM-SHA-256 and SCRAM-SHA-256-PLUS, md5, cleartext,
@@ -253,6 +254,27 @@ while (out.next()) { fs.write(f, out.data); }
 `row()` writes COPY's text format (tab-separated, escaped, NULL as `\N`); bytea goes as its
 `\x...` hex text there. A bad row fails `end()` with the server's error and nothing is copied.
 From a pool, use `db.acquire()`.
+
+### Binary COPY from structs
+
+```c
+pg.CopyInto<Item> in = c.copyInto<Item>("items");    // the columns Item's fields name
+for (auto x : items) { in.put(x); }
+i64 n = in.end();                                    // in.abort() gives up
+```
+
+`copyInto<T>` reads the table's column types once and sends each row in PostgreSQL's binary
+format: nothing to format or parse, about 2.5x faster than `row()` (100,000 rows of five
+columns: 55 ms against 136 ms).
+
+- Fields name columns as when scanning (`@key`, else the name; `@skip` and private fields left
+  out); the other columns get their defaults. A null pointer field is NULL.
+- Column types: the integers, `float4`/`float8`, `bool`, `bytea`, `uuid` (16 bytes), `timestamp`,
+  `timestamptz` and `date` (from `date.Date`), `interval` (`pg.Interval`), `text`, `varchar`,
+  `char`, `name`, `json`, `jsonb` (text, or a struct encoded as JSON) and enums.
+- A field with no column, or a column of another type (`numeric`, arrays, `inet`...), is
+  `ERR_ARG` from `copyInto`; use `copyIn` and `row()` for those tables. A value that can't go in
+  its column (a `String` into an `int8`) is `ERR_ARG` from `put`, before any of the row is sent.
 
 ## LISTEN and NOTIFY
 

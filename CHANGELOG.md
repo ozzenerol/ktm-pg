@@ -5,6 +5,8 @@
 - `pg.queryResult<T>(db, sql, ...)`: every row in a `pg.Result<T>` (`len`, `data`, `at(i)`,
   range-for), the rows' text and bytes in a few large blocks freed together by `res.free()`.
   About 20% faster than `queryAll` on a 1000-row result.
+- `c.copyInto<T>(table)` and `put(x)`: COPY in PostgreSQL's binary format from structs, the
+  columns' types read from the table; about 2.5x faster than text `row()`s.
 - A null pool (`r.app` when `http.listen` got none) throws `ERR_ARG` saying so instead of
   crashing: `queryOne`, `queryAll` and the `Pool` calls.
 
