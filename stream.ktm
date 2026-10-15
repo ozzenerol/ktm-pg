@@ -136,7 +136,7 @@ static bool streamDial(Stream *s, u8[] host, i32 port, i64 timeoutMs)
     s.write = &tcpWrite;
     s.close = &tcpClose;
     if (host.len && host[0] == '/') {
-        ad String path = str.format("%s/.s.PGSQL.%d", host, port);
+        scoped String path = str.format("%s/.s.PGSQL.%d", host, port);
         s.fd = net.unixDial(path);
         if (s.fd < 0) { return false; }
         if (s.loop) { net.setNonBlocking(s.fd); }

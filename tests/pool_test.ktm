@@ -7,11 +7,11 @@ import atomic, coro, date, json, libc, reflect, t, thread, vec;
 
 void basics()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Pool *db = pg.open(u);
     db.execScript("DROP TABLE IF EXISTS pool_t; CREATE TABLE pool_t (id int8, name text)");
     t.ok(db.exec("INSERT INTO pool_t VALUES ($1, $2), ($3, $4)", 1, "a", 2, "b") == 2, "exec on a pool");
-    ad pg.Rows r = db.query("SELECT id FROM pool_t ORDER BY id");
+    scoped pg.Rows r = db.query("SELECT id FROM pool_t ORDER BY id");
     t.ok(db.openCount() == 1 && db.idleCount() == 0, "the rows hold the connection");
     i64 sum = 0;
     while (r.next()) { sum += r.int(0); }
@@ -70,7 +70,7 @@ void basics()
 
 void limits()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 2;
     o.acquireTimeoutMs = 200;
@@ -109,7 +109,7 @@ void limits()
     t.ok(db.openCount() <= 2, "never more than maxConns");
 
     /* a wrong password shows at the first use */
-    ad String bad = t.url("ktm_scram", "wrong");
+    scoped String bad = t.url("ktm_scram", "wrong");
     pg.Pool *nope = pg.open(bad);
     code = 0;
     try { nope.ping(); } catch (Error e) { code = e.code; }
@@ -141,7 +141,7 @@ void *worker(void *arg)
 
 void coroutines()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 4;
     gDb = pg.open(u, &o);
@@ -171,7 +171,7 @@ void threadWork(void *priv, void *arg)
 
 void threads()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 3;
     pg.Pool *db = pg.open(u, &o);
@@ -197,7 +197,7 @@ void hoard(void *priv, void *arg)
 
 void stealing()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 2;
     o.acquireTimeoutMs = 5000;

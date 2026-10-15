@@ -97,7 +97,7 @@ separately from the SQL, never formatted into it.
 ## Reading rows
 
 ```c
-ad pg.Rows r = c.query("SELECT id, name, born FROM users WHERE id > $1", 10);
+scoped pg.Rows r = c.query("SELECT id, name, born FROM users WHERE id > $1", 10);
 while (r.next()) {
     i64 id = r.int(0);
     u8[] name = r.text(1);       // a view, valid until the next row
@@ -107,7 +107,7 @@ while (r.next()) {
 
 `r.int(i)`, `r.float(i)`, `r.bool(i)`, `r.text(i)`, `r.bytes(i)` (bytea), `r.micros(i)`
 (timestamps as microseconds since 1970, UTC) and `r.date(i)` read column `i`; `r.cols`,
-`r.name(i)`, `r.typeOid(i)` and `r.column("name")` describe them. `r.free()` (or `ad`) reads
+`r.name(i)`, `r.typeOid(i)` and `r.column("name")` describe them. `r.free()` (or `scoped`) reads
 and drops the rows that are left and gives the connection back; the connection runs nothing
 else of the same coroutine until then.
 
@@ -152,7 +152,7 @@ rows' text and bytes (their `String`, `u8[]` and `u8 *` fields) in a few large b
 of a malloc each, and frees them all at once:
 
 ```c
-ad pg.Result<User> users = pg.queryResult<User>(db, "SELECT id, name, email FROM users");
+scoped pg.Result<User> users = pg.queryResult<User>(db, "SELECT id, name, email FROM users");
 for (auto u : users) { printf("%d %s\n", u.id, u.name); }      // users.len, users.data, users.at(i)
 String keep = users.at(0).name.clone();                          // a copy that outlives users
 ```
@@ -160,7 +160,7 @@ String keep = users.at(0).name.clone();                          // a copy that 
 - Those `String`s and slices are views into the `Result`: read them while it lives, `clone()`
   what you keep, and don't free or append to them.
 - Other fields that allocate (a pointer, a `vec.Vec`, a `json` column into a struct) are their
-  own allocations, as with `queryAll`; `res.free()` (or `ad`) frees them too.
+  own allocations, as with `queryAll`; `res.free()` (or `scoped`) frees them too.
 - A 1000-row query of three columns is about 20% faster than `queryAll` from end to end
   (1 malloc per few thousand values instead of one per value).
 

@@ -193,8 +193,8 @@ static Config configParse(u8[] url)
             if (!pair.len) { continue; }
             u8[] k = pair, v = "";
             if (str.splitFirst(pair, "=", &before, &after)) { k = before; v = after; }
-            ad String key = decoded(k, "query");
-            ad String value = decoded(v, "query");
+            scoped String key = decoded(k, "query");
+            scoped String value = decoded(v, "query");
             configSet(&c, key, value);
         }
         if (!c.host.len) {
@@ -244,9 +244,9 @@ static Config configParse(u8[] url)
         /* libpq's files in ~/.postgresql, when they exist */
         u8[] home = envOr("HOME");
         if (home.len) {
-            ad String root = str.format("%s/.postgresql/root.crt", home);
-            ad String crt = str.format("%s/.postgresql/postgresql.crt", home);
-            ad String key = str.format("%s/.postgresql/postgresql.key", home);
+            scoped String root = str.format("%s/.postgresql/root.crt", home);
+            scoped String crt = str.format("%s/.postgresql/postgresql.crt", home);
+            scoped String key = str.format("%s/.postgresql/postgresql.key", home);
             if (!c.sslRootCert.len && fs.exists(root)) { configSet(&c, "sslrootcert", root); }
             if (!c.sslCert.len && fs.exists(crt) && fs.exists(key)) {
                 configSet(&c, "sslcert", crt);

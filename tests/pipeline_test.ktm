@@ -17,7 +17,7 @@ void *worker(void *arg)
             i64 got;
             if (i % 5 == 0) {
                 /* a statement of its own: prepared while others pipeline */
-                ad String q = str.format("SELECT $1::int8 + %d", id);
+                scoped String q = str.format("SELECT $1::int8 + %d", id);
                 got = pg.queryOne<i64>(gC, q, i) - id;
             } else {
                 got = pg.queryOne<i64>(gC, "SELECT $1::int8", i);
@@ -50,7 +50,7 @@ void *failer(void *arg)
 
 void shared()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     gC = pg.connect(u);
     gGood = 0;
     gBad = 0;
@@ -74,13 +74,13 @@ i64 gSecond;
 
 void *holder(void *arg)
 {
-    ad pg.Rows r = gC.query("SELECT x FROM generate_series(1, 3) x");
+    scoped pg.Rows r = gC.query("SELECT x FROM generate_series(1, 3) x");
     coro.sleep(50);
     i64 n = 0;
     while (r.next()) { n += r.int(0); }
     gOrder = gOrder * 10 + 1;
     i64 code = 0;
-    ad pg.Rows r2 = gC.query("SELECT 1");
+    scoped pg.Rows r2 = gC.query("SELECT 1");
     try { gC.exec("SELECT 2"); } catch (Error e) { code = e.code; }
     if (code == pg.ERR_CLOSED) { gOrder = gOrder * 10 + 7; }
     return null;
@@ -95,7 +95,7 @@ void *second(void *arg)
 
 void rowsInTurn()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     gC = pg.connect(u);
     gOrder = 0;
     coro.go(&holder);
@@ -118,7 +118,7 @@ void *queued(void *arg)
 void *killer(void *arg)
 {
     coro.sleep(50);
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *k = pg.connect(u);
     k.exec("SELECT pg_terminate_backend($1)", gC.backendPid());
     k.close();
@@ -127,7 +127,7 @@ void *killer(void *arg)
 
 void broken()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     gC = pg.connect(u);
     gFailed = 0;
     for (i64 i = 0; i < 10; i++) { coro.go(&queued); }
@@ -157,7 +157,7 @@ void *poolWorker(void *arg)
 
 void pooled()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 2;
     gDb = pg.open(u, &o);

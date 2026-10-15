@@ -7,7 +7,7 @@ import coro, cstr, date, proc, str, t;
 i64 codeOf(pg.Conn *c, u8[] sql, String *msg = null)
 {
     try {
-        ad pg.Rows r = c.query(sql);
+        scoped pg.Rows r = c.query(sql);
         while (r.next()) { }
     } catch (Error e) {
         if (msg) { msg.append(cstr.view(e.message)); }
@@ -19,12 +19,12 @@ i64 codeOf(pg.Conn *c, u8[] sql, String *msg = null)
 
 void timeouts()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     defer c.close();
     c.setQueryTimeout(200);
     i64 start = date.monoMs();
-    ad String msg = str.new();
+    scoped String msg = str.new();
     i64 code = codeOf(c, "SELECT pg_sleep(5)", &msg);
     i64 took = date.monoMs() - start;
     t.ok(code == pg.QUERY_CANCELED && took >= 190 && took < 2000, "a slow query is cancelled");
@@ -56,7 +56,7 @@ void timeouts()
     t.ok(pg.queryOne<i64>(c, "SELECT 1 FROM pg_sleep(0.3)") == 1, "no limit again");
 
     /* the server's own statement_timeout */
-    ad String st = t.url("postgres", "ktm", "?statement_timeout=100");
+    scoped String st = t.url("postgres", "ktm", "?statement_timeout=100");
     pg.Conn *s = pg.connect(st);
     t.ok(codeOf(s, "SELECT pg_sleep(2)") == pg.QUERY_CANCELED && pg.queryOne<i64>(s, "SELECT 2") == 2, "statement_timeout");
     s.close();
@@ -84,7 +84,7 @@ void *canceller(void *arg)
 
 void *timed(void *arg)
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     c.setQueryTimeout(150);
     i64 start = date.monoMs();
@@ -96,7 +96,7 @@ void *timed(void *arg)
 
 void coroutines()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     gConn = pg.connect(u);
     coro.go(&sleeper);
     coro.go(&canceller);
@@ -112,7 +112,7 @@ void coroutines()
 
 void pooled()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.queryTimeoutMs = 150;
     pg.Pool *db = pg.open(u, &o);
@@ -133,13 +133,13 @@ void pooled()
  * within its limit, and the connection is given up */
 void freeze()
 {
-    ad String ct = t.container();
+    scoped String ct = t.container();
     proc.shellf("docker pause %s >/dev/null", ct);
 }
 
 void thaw()
 {
-    ad String ct = t.container();
+    scoped String ct = t.container();
     proc.shellf("docker unpause %s >/dev/null", ct);
 }
 
@@ -154,7 +154,7 @@ i64 pingCode(pg.Conn *c)
 
 void frozen()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     c.setQueryTimeout(300);
     freeze();
@@ -204,7 +204,7 @@ void frozenPoolRun()
     i64 took = date.monoMs() - start;
     thaw();
     /* the ping (at most 1 s, no cancel), then a connect in what is left */
-    ad String what = str.format("%sacquire() on a frozen server: ERR_CONNECT within acquireTimeoutMs (%d ms)", where, took);
+    scoped String what = str.format("%sacquire() on a frozen server: ERR_CONNECT within acquireTimeoutMs (%d ms)", where, took);
     t.ok(code == pg.ERR_CONNECT && took < 2000 + 700, what.cstr());
     t.ok(db.openCount() == 0, "nothing left open");
     t.ok(pg.queryOne<i64>(db, "SELECT 2") == 2, "the pool works again");
@@ -230,7 +230,7 @@ void *frozenPoolCo(void *arg)
  * connection both end within acquireTimeoutMs */
 void frozenPool(bool loop)
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 2;
     o.acquireTimeoutMs = 2000;

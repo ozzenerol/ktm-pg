@@ -22,7 +22,7 @@ struct Row
 i32 main()
 {
     t.start("result");
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
 
     u8[] sql = "SELECT g AS id, 'name-' || g AS name, decode(lpad(to_hex(g), 4, '0'), 'hex') AS blob,"
@@ -30,13 +30,13 @@ i32 main()
                " ARRAY[g, g + 1] AS nums, json_build_object('name', 'tag' || g, 'weight', g)::json AS tag"
                " FROM generate_series(1, $1::int) g";
     {
-        ad pg.Result<Row> res = pg.queryResult<Row>(c, sql, 1000);
+        scoped pg.Result<Row> res = pg.queryResult<Row>(c, sql, 1000);
         t.ok(res.len == 1000, "1000 rows");
         bool same = true;
         i64 seen = 0;
         for (auto r : res) {
             seen++;
-            ad String want = str.format("name-%d", r.id);
+            scoped String want = str.format("name-%d", r.id);
             same = same && r.id == seen && r.name.equals(want) && r.name.ptr[r.name.len] == 0 &&
                    r.blob.len == 2 && r.blob[1] == (u8)(r.id & 0xff) &&
                    ((r.id % 2 == 0) ? (r.note && str.equals(cstr.view(r.note), "even")) : r.note == null) &&
@@ -63,24 +63,24 @@ i32 main()
         /* a value kept past the Result: cloned */
         String keep = res.at(41).name.clone();
         res.free();
-        t.ok(res.len == 0 && res.data == null, "free empties it (and ad's free after it is harmless)");
+        t.ok(res.len == 0 && res.data == null, "free empties it (and scoped's free after it is harmless)");
         t.ok(keep.equals("name-42"), "a clone outlives it");
         keep.free();
     }
 
     /* a scalar and a String per row */
     {
-        ad pg.Result<i64> ns = pg.queryResult<i64>(c, "SELECT g FROM generate_series(1, 5) g");
+        scoped pg.Result<i64> ns = pg.queryResult<i64>(c, "SELECT g FROM generate_series(1, 5) g");
         i64 sum = 0;
         for (auto n : ns) { sum += n; }
         t.ok(ns.len == 5 && sum == 15, "a Result<i64>");
-        ad pg.Result<String> ss = pg.queryResult<String>(c, "SELECT 'x' || g FROM generate_series(1, 3) g");
+        scoped pg.Result<String> ss = pg.queryResult<String>(c, "SELECT 'x' || g FROM generate_series(1, 3) g");
         t.ok(ss.len == 3 && ss.at(2).equals("x3"), "a Result<String>");
     }
 
     /* no rows, and an error half way: nothing left behind */
     {
-        ad pg.Result<Row> none = pg.queryResult<Row>(c, sql, 0);
+        scoped pg.Result<Row> none = pg.queryResult<Row>(c, sql, 0);
         t.ok(none.len == 0 && none.data == null, "no rows");
         i64 code = 0;
         try {
@@ -95,7 +95,7 @@ i32 main()
     /* through a pool, and a big one: the arena grows block by block */
     {
         pg.Pool *p = pg.open(u);
-        ad pg.Result<Row> big = pg.queryResult<Row>(p, "SELECT g AS id, repeat('y', 300) AS name"
+        scoped pg.Result<Row> big = pg.queryResult<Row>(p, "SELECT g AS id, repeat('y', 300) AS name"
                                                         " FROM generate_series(1, 20000) g");
         t.ok(big.len == 20000 && big.at(19999).name.len == 300 && big.at(0).name.ptr[0] == 'y',
              "20000 rows of 300 bytes through a pool");

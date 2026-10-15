@@ -93,7 +93,7 @@ struct Back
 i32 main()
 {
     t.start("copy binary");
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     c.exec("DROP TABLE IF EXISTS copybin");
     c.exec("DROP TYPE IF EXISTS mood");
@@ -118,8 +118,8 @@ i32 main()
     for (i64 k = 0; k < rows.len && same; k++) {
         Back *b = &rows.data[k];
         i64 i = k + 1;
-        ad String name = str.format("item-%d", i);
-        ad String hex = str.format("%02x", i & 0xff);
+        scoped String name = str.format("item-%d", i);
+        scoped String hex = str.format("%02x", i & 0xff);
         same = b.id == i && b.small == i % 1000 && b.mid == i * 7 && b.price == (f64)i / 4.0 &&
                b.active == (i % 2 == 0) && b.name.equals(name) && b.label.equals("t\tab\\") &&
                b.blob.len == 2 && b.blob[1] == 1 && b.uid.endsWith(hex) &&
@@ -151,7 +151,7 @@ i32 main()
     /* a value of the wrong kind: refused, the row not written, the COPY goes on */
     c.exec("CREATE TEMP TABLE copykinds (id int8, name text)");
     {
-        ad pg.CopyInto<Wrong> w = c.copyInto<Wrong>("copykinds");
+        scoped pg.CopyInto<Wrong> w = c.copyInto<Wrong>("copykinds");
         Wrong x;
         x.id = str.from("7");
         x.name = str.from("n");
@@ -163,7 +163,7 @@ i32 main()
         w.abort();
     }
     {
-        ad pg.CopyInto<Right> r = c.copyInto<Right>("copykinds");
+        scoped pg.CopyInto<Right> r = c.copyInto<Right>("copykinds");
         Right x;
         x.id = 1;
         x.name = str.from("one");

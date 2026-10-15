@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1 (unreleased)
+
+- The code, tests and examples declare with `scoped` instead of `ad` (ktm v0.24.0 renamed it;
+  v0.25.0 removes `ad`).
+- Needs ktm 0.24 (`ktm.mod`).
+
 ## v0.2.0 (2026-10-15)
 
 - `pg.queryResult<T>(db, sql, ...)`: every row in a `pg.Result<T>` (`len`, `data`, `at(i)`,

@@ -72,8 +72,8 @@ static String quoteIdent(u8[] name)
 /* Listen on a channel (any name: it is quoted) */
 pub void Conn.listen(u8[] channel)
 {
-    ad String q = quoteIdent(channel);
-    ad String sql = str.format("LISTEN %s", q);
+    scoped String q = quoteIdent(channel);
+    scoped String sql = str.format("LISTEN %s", q);
     self.execScript(sql);
 }
 
@@ -84,8 +84,8 @@ pub void Conn.unlisten(u8[] channel)
         self.execScript("UNLISTEN *");
         return;
     }
-    ad String q = quoteIdent(channel);
-    ad String sql = str.format("UNLISTEN %s", q);
+    scoped String q = quoteIdent(channel);
+    scoped String sql = str.format("UNLISTEN %s", q);
     self.execScript(sql);
 }
 

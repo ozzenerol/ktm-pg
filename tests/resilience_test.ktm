@@ -18,12 +18,12 @@ void waitUp(u8[] url)
 
 void restart()
 {
-    { ad String ct = t.container(); proc.shellf("docker restart -t 1 %s >/dev/null", ct); }
+    { scoped String ct = t.container(); proc.shellf("docker restart -t 1 %s >/dev/null", ct); }
 }
 
 void idleAfterRestart()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 4;
     pg.Pool *db = pg.open(u, &o);
@@ -46,15 +46,15 @@ void idleAfterRestart()
 
 void serverDown()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Pool *db = pg.open(u);
-    { ad String ct = t.container(); proc.shellf("docker stop -t 1 %s >/dev/null", ct); }
+    { scoped String ct = t.container(); proc.shellf("docker stop -t 1 %s >/dev/null", ct); }
     i64 start = date.monoMs();
     i64 code = 0;
     try { db.exec("SELECT 1"); } catch (Error e) { code = e.code; }
     t.ok(code == pg.ERR_CONNECT && date.monoMs() - start < 5000, "server down: ERR_CONNECT at once");
     t.ok(db.openCount() == 0, "nothing counted open");
-    { ad String ct = t.container(); proc.shellf("docker start %s >/dev/null", ct); }
+    { scoped String ct = t.container(); proc.shellf("docker start %s >/dev/null", ct); }
     waitUp(u);
     t.ok(pg.queryOne<i64>(db, "SELECT 5") == 5, "back when the server is");
     db.close();
@@ -91,13 +91,13 @@ void *loader(void *arg)
 void *restarter(void *arg)
 {
     coro.sleep(1000);
-    { ad String ct = t.container(); proc.shellf("docker restart -t 1 %s >/dev/null", ct); }     /* blocks this loop's thread a moment */
+    { scoped String ct = t.container(); proc.shellf("docker restart -t 1 %s >/dev/null", ct); }     /* blocks this loop's thread a moment */
     return null;
 }
 
 void underLoad()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 8;
     o.acquireTimeoutMs = 2000;
