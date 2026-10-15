@@ -30,9 +30,9 @@ i64 get(i64 n)
         if (fd < 0) { date.sleepMs(10); }
     }
     if (fd < 0) { atomic.add(&gNoDial, 1); return -1; }
-    ad String req = str.format("GET /double/%d HTTP/1.0\r\n\r\n", n);
+    scoped String req = str.format("GET /double/%d HTTP/1.0\r\n\r\n", n);
     net.send(fd, req);
-    ad String resp = str.new();
+    scoped String resp = str.new();
     u8 buf[4096];
     while (true) {
         i64 got = libc.read(fd, buf, 4096);
@@ -70,7 +70,7 @@ void clients(void *priv, void *arg)
 i32 main()
 {
     t.start("http");
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Options o;
     o.maxConns = 6;
     pg.Pool *db = pg.open(u, &o);

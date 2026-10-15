@@ -43,7 +43,7 @@ static bool Conn.simpleTag(u8[] sql, u8[] want)
 pub Tx Conn.begin(u8[] mode = "")
 {
     if (mode.len) {
-        ad String sql = str.format("BEGIN %s", mode);
+        scoped String sql = str.format("BEGIN %s", mode);
         self.simpleTag(sql, "BEGIN");
     } else {
         self.simpleTag("BEGIN", "BEGIN");

@@ -18,13 +18,13 @@ i64 tryConnect(u8[] url)
 
 void auth()
 {
-    ad String scram = t.url("ktm_scram", "scrampw");
-    ad String md5 = t.url("ktm_md5", "md5pw");
-    ad String clear = t.url("ktm_clear", "clearpw");
-    ad String trust = t.url("ktm_trust", "");
-    ad String bad = t.url("ktm_scram", "nope");
-    ad String badMd5 = t.url("ktm_md5", "nope");
-    ad String none = t.url("ktm_scram", "");
+    scoped String scram = t.url("ktm_scram", "scrampw");
+    scoped String md5 = t.url("ktm_md5", "md5pw");
+    scoped String clear = t.url("ktm_clear", "clearpw");
+    scoped String trust = t.url("ktm_trust", "");
+    scoped String bad = t.url("ktm_scram", "nope");
+    scoped String badMd5 = t.url("ktm_md5", "nope");
+    scoped String none = t.url("ktm_scram", "");
     t.ok(tryConnect(scram) == 0, "scram user connects");
     t.ok(tryConnect(md5) == 0, "md5 user connects");
     t.ok(tryConnect(clear) == 0, "cleartext user connects");
@@ -33,17 +33,17 @@ void auth()
     t.ok(tryConnect(badMd5) == pg.INVALID_PASSWORD, "wrong md5 password is 28P01");
     t.ok(tryConnect(none) == pg.ERR_AUTH, "no password is ERR_AUTH");
     t.ok(tryConnect("postgres://postgres:ktm@127.0.0.1:1/x") == pg.ERR_CONNECT, "refused port is ERR_CONNECT");
-    ad String ssl = t.url("postgres", "ktm", "?sslmode=require");
+    scoped String ssl = t.url("postgres", "ktm", "?sslmode=require");
     t.ok(tryConnect(ssl) == 0, "sslmode=require connects (the test servers have TLS)");
-    ad String pt = t.port();
-    ad String nodb = str.format("postgres://postgres:ktm@127.0.0.1:%s/no_such_db", pt);
+    scoped String pt = t.port();
+    scoped String nodb = str.format("postgres://postgres:ktm@127.0.0.1:%s/no_such_db", pt);
     t.ok(tryConnect(nodb) == pg.state("3D000"), "unknown database is 3D000");
     t.ok(tryConnect("mysql://x") == pg.ERR_CONNECT, "other scheme is ERR_CONNECT");
 }
 
 void env()
 {
-    ad String port = t.port();
+    scoped String port = t.port();
     libc.setenv("PGHOST", "127.0.0.1", 1);
     libc.setenv("PGPORT", port.cstr(), 1);
     libc.setenv("PGUSER", "ktm_md5", 1);
@@ -51,13 +51,13 @@ void env()
     libc.setenv("PGDATABASE", "ktm_test", 1);
     libc.setenv("PGAPPNAME", "ktm-env", 1);
     pg.Conn *c = pg.connect();
-    ad pg.Rows r = c.query("SELECT current_user, current_database(), current_setting('application_name')");
+    scoped pg.Rows r = c.query("SELECT current_user, current_database(), current_setting('application_name')");
     t.ok(r.next(), "env: a row");
     t.ok(r.text(0).equals("ktm_md5") && r.text(1).equals("ktm_test") && r.text(2).equals("ktm-env"), "env: PG* used");
     r.free();
     c.close();
     /* the URL wins over the environment; extra keys are runtime parameters */
-    ad String u = t.url("postgres", "ktm", "?application_name=url%20app&search_path=public");
+    scoped String u = t.url("postgres", "ktm", "?application_name=url%20app&search_path=public");
     c = pg.connect(u);
     r = c.query("SELECT current_user, current_setting('application_name')");
     t.ok(r.next() && r.text(0).equals("postgres") && r.text(1).equals("url app"), "env: the URL wins");
@@ -71,7 +71,7 @@ void queries(pg.Conn *c)
 {
     c.execScript("DROP TABLE IF EXISTS wire_t; CREATE TABLE wire_t (id int8 PRIMARY KEY, name text, score float8, ok bool, note text)");
     i64 id = 1;
-    ad String name = str.from("ann");
+    scoped String name = str.from("ann");
     f64 score = 2.5;
     bool yes = true;
     u8 *note = null;
@@ -87,7 +87,7 @@ void queries(pg.Conn *c)
     t.ok(c.execArgs("DELETE FROM wire_t WHERE id > $1", a) == 1, "execArgs with a reflect.Value[]");
     t.ok(c.exec("UPDATE wire_t SET score = score * 2") == 2, "update counts 2");
 
-    ad pg.Rows r = c.query("SELECT id, name, score, ok, note FROM wire_t ORDER BY id");
+    scoped pg.Rows r = c.query("SELECT id, name, score, ok, note FROM wire_t ORDER BY id");
     t.ok(r.cols == 5, "5 columns");
     t.ok(r.name(1).equals("name") && r.column("note") == 4 && r.typeOid(0) == pg.INT8, "column names and types");
     i64 n = 0;
@@ -139,11 +139,11 @@ void queries(pg.Conn *c)
 void errors(pg.Conn *c)
 {
     i64 code = 0;
-    ad String msg = str.new();
+    scoped String msg = str.new();
     try { c.exec("SELEC 1"); } catch (Error e) { code = e.code; msg.append(cstr.view(e.message)); }
     t.ok(code == pg.SYNTAX_ERROR && pg.isServerError(code), "syntax error is 42601");
     t.ok(str.contains(msg, "(SQLSTATE 42601)"), "message has the SQLSTATE");
-    ad String st = pg.stateText(code);
+    scoped String st = pg.stateText(code);
     t.ok(st.equals("42601"), "stateText");
     t.ok(c.exec("SELECT 1") == 1, "usable after an error");
 
@@ -154,7 +154,7 @@ void errors(pg.Conn *c)
     t.ok(str.contains(msg, "detail: Key (id)=(1) already exists."), "message has the detail");
 
     /* an error half way through the rows */
-    ad pg.Rows r = c.query("SELECT 10 / (x - 3) FROM generate_series(1, 5) x");
+    scoped pg.Rows r = c.query("SELECT 10 / (x - 3) FROM generate_series(1, 5) x");
     i64 rows = 0;
     code = 0;
     try {
@@ -178,8 +178,8 @@ void cache(pg.Conn *c)
     bool good = true;
     for (i64 round = 0; round < 2; round++) {
         for (i64 i = 0; i < 300; i++) {
-            ad String q = str.format("SELECT %d + $1::int8", i);
-            ad pg.Rows r = c.query(q, round);
+            scoped String q = str.format("SELECT %d + $1::int8", i);
+            scoped pg.Rows r = c.query(q, round);
             if (!r.next() || r.int(0) != i + round) { good = false; }
         }
     }
@@ -207,7 +207,7 @@ void transactions(pg.Conn *c)
         defer tx.rollback();
         tx.exec("INSERT INTO wire_tx VALUES (2)");
     }
-    ad pg.Rows r = c.query("SELECT count(*) FROM wire_tx");
+    scoped pg.Rows r = c.query("SELECT count(*) FROM wire_tx");
     t.ok(r.next() && r.int(0) == 1, "commit kept, rollback dropped");
     r.free();
 
@@ -251,7 +251,7 @@ void *inLoop(void *arg)
 
 void threads()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     gShared = pg.connect(u);
     thread.Pool *tp = thread.poolNew(1);
     thread.poolEnqueue(tp, null, &useIt);
@@ -285,7 +285,7 @@ void *sleeper(void *arg)
 
 void loop()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     i64 start = date.monoMs();
     for (i64 i = 0; i < 8; i++) { coro.go(&sleeper, &u); }
     coro.run();
@@ -299,7 +299,7 @@ i32 main()
     t.start("wire");
     auth();
     env();
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     t.ok(c.serverVersion().len > 0 && c.txState() == 'I' && c.backendPid() > 0, "connection state");
     queries(c);

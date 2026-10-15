@@ -75,7 +75,7 @@ pub String url(u8[] user = "postgres", u8[] password = "ktm", u8[] extra = "")
 {
     String u = str.format("postgres://%s", user);
     if (password.len) { u.appendFormat(":%s", password); }
-    ad String p = port();
+    scoped String p = port();
     u.appendFormat("@127.0.0.1:%s/ktm_test%s", p, extra);
     return u;
 }

@@ -1,3 +1,3 @@
 module github.com/ozzenerol/ktm-pg
 
-ktm 0.22
+ktm 0.24

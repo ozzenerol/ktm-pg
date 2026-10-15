@@ -7,7 +7,7 @@ import coro, cstr, date, json, reflect, str, t, vec;
 
 void notifications()
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *l = pg.connect(u);
     pg.Conn *s = pg.connect(u);
     l.listen("jobs");
@@ -41,7 +41,7 @@ i64 gGot;
 
 void *listener(void *arg)
 {
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *l = pg.connect(u);
     l.listen("loop");
     pg.Notification n;
@@ -56,7 +56,7 @@ void *listener(void *arg)
 void *sender(void *arg)
 {
     coro.sleep(100);
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *s = pg.connect(u);
     for (i64 i = 0; i < 5; i++) { s.notify("loop", "x"); coro.sleep(10); }
     s.close();
@@ -82,7 +82,7 @@ void copying(pg.Conn *c)
     }
     t.ok(in.end() == 1000, "COPY FROM STDIN: 1000 rows");
     t.ok(pg.queryOne<i64>(c, "SELECT count(*) FROM copy_t WHERE note IS NULL") == 500, "NULLs");
-    ad String note = pg.queryOne<String>(c, "SELECT note FROM copy_t WHERE id = 1");
+    scoped String note = pg.queryOne<String>(c, "SELECT note FROM copy_t WHERE id = 1");
     t.ok(note.equals("tab\there, line\nend, back\\slash"), "escapes round trip");
     in = c.copyIn("COPY copy_t (id, name) FROM STDIN (FORMAT csv)");
     in.write("2000,\"a, b\"\n2001,c\n");
@@ -101,7 +101,7 @@ void copying(pg.Conn *c)
     t.ok(code == pg.UNDEFINED_TABLE && pg.queryOne<i64>(c, "SELECT 1") == 1, "COPY of a missing table");
 
     pg.CopyOut out = c.copyOut("COPY (SELECT id, name FROM copy_t WHERE id < 3 ORDER BY id) TO STDOUT (FORMAT csv)");
-    ad String all = str.new();
+    scoped String all = str.new();
     while (out.next()) { all.append(out.data); }
     t.ok(all.equals("0,name\n1,name\n2,name\n") && out.rows() == 3, "COPY TO STDOUT");
     out.free();
@@ -119,7 +119,7 @@ void arrays(pg.Conn *c)
     tags.push(str.from("a"));
     tags.push(str.from("b \"c\",d\\e"));
     tags.push(str.from("NULL"));
-    ad String back = pg.queryOne<String>(c, "SELECT $1::int8[]::text", nums);
+    scoped String back = pg.queryOne<String>(c, "SELECT $1::int8[]::text", nums);
     t.ok(back.equals("{1,-2,3}"), "an i64 array as int8[]");
     vec.Vec<String> got = pg.queryOne<vec.Vec<String>>(c, "SELECT $1::text[]", tags);
     t.ok(got.len == 3 && got.get(1).equals("b \"c\",d\\e") && got.get(2).equals("NULL"), "a Vec<String> as text[] and back, quotes and all");
@@ -134,7 +134,7 @@ void arrays(pg.Conn *c)
     vec.Vec<f64> fs = pg.queryOne<vec.Vec<f64>>(c, "SELECT ARRAY[1.5, NULL, 2.25]::float8[]");
     t.ok(fs.len == 3 && fs.get(0) == 1.5 && fs.get(1) == 0 && fs.get(2) == 2.25, "NULL elements are 0");
     fs.free();
-    ad String nested = pg.queryOne<String>(c, "SELECT ARRAY[[1,2],[3,4]]::text");
+    scoped String nested = pg.queryOne<String>(c, "SELECT ARRAY[[1,2],[3,4]]::text");
     t.ok(nested.equals("{{1,2},{3,4}}"), "a 2-D array as text");
     vec.Vec<i64> empty = pg.queryOne<vec.Vec<i64>>(c, "SELECT '{}'::int8[]");
     t.ok(empty.len == 0, "an empty array");
@@ -149,15 +149,15 @@ void intervals(pg.Conn *c)
 {
     pg.Interval iv = pg.queryOne<pg.Interval>(c, "SELECT '1 year 2 mons 3 days 04:05:06.5'::interval");
     t.ok(iv.months == 14 && iv.days == 3 && iv.micros == 14706500000, "an interval");
-    ad String txt = pg.queryOne<String>(c, "SELECT '1 year 2 mons 3 days 04:05:06.5'::interval");
+    scoped String txt = pg.queryOne<String>(c, "SELECT '1 year 2 mons 3 days 04:05:06.5'::interval");
     t.ok(txt.equals("1 year 2 mons 3 days 04:05:06.5"), "its text as the server writes it");
     pg.Interval back = pg.queryOne<pg.Interval>(c, "SELECT $1::interval * 2", iv);
     t.ok(back.months == 28 && back.days == 6 && back.micros == 29413000000, "an interval parameter");
-    ad String neg = pg.queryOne<String>(c, "SELECT '-1 day -00:00:01'::interval");
+    scoped String neg = pg.queryOne<String>(c, "SELECT '-1 day -00:00:01'::interval");
     t.ok(neg.equals("-1 days -00:00:01"), "negative parts");
-    ad String zero = pg.queryOne<String>(c, "SELECT '0'::interval");
+    scoped String zero = pg.queryOne<String>(c, "SELECT '0'::interval");
     t.ok(zero.equals("00:00:00"), "zero");
-    ad String ip = pg.queryOne<String>(c, "SELECT $1::inet", "192.168.1.5/24");
+    scoped String ip = pg.queryOne<String>(c, "SELECT $1::inet", "192.168.1.5/24");
     t.ok(ip.equals("192.168.1.5/24"), "inet as text");
 }
 
@@ -167,7 +167,7 @@ void batches(pg.Conn *c)
     pg.Batch b;
     defer b.free();
     for (i64 i = 0; i < 100; i++) {
-        ad String name = str.format("n%d", i);
+        scoped String name = str.format("n%d", i);
         String tags[2] = {str.from("a"), str.from("b")};
         b.add("INSERT INTO batch_t VALUES ($1, $2, $3, $4)", i, name, tags, tags);
         tags[0].free();
@@ -177,14 +177,14 @@ void batches(pg.Conn *c)
     i64[] counts = c.execBatch(&b);
     t.ok(counts.len == 101 && counts[0] == 1 && counts[100] == 10, "a batch of 101 statements");
     counts.free();
-    ad String tg = pg.queryOne<String>(c, "SELECT tags::text || doc::text FROM batch_t WHERE id = 5");
+    scoped String tg = pg.queryOne<String>(c, "SELECT tags::text || doc::text FROM batch_t WHERE id = 5");
     t.ok(tg.equals("{a,b}[\"a\", \"b\"]"), "lists as an array and as JSON, by the column's type");
     b.clear();
     b.add("INSERT INTO batch_t (id) VALUES ($1)", 1000);
     b.add("INSERT INTO batch_t (id) VALUES ($1)", 1);       /* a duplicate */
     b.add("INSERT INTO batch_t (id) VALUES ($1)", 1001);
     i64 code = 0;
-    ad String msg = str.new();
+    scoped String msg = str.new();
     try { c.execBatch(&b); } catch (Error e) { code = e.code; msg.append(cstr.view(e.message)); }
     t.ok(code == pg.UNIQUE_VIOLATION && str.contains(msg, "batch statement 2"), "a failing statement: its error and number");
     t.ok(pg.queryOne<i64>(c, "SELECT count(*) FROM batch_t") == 100, "and nothing of the batch stays");
@@ -196,7 +196,7 @@ i32 main()
     t.start("features");
     notifications();
     loopNotifications();
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     copying(c);
     arrays(c);

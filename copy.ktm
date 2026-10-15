@@ -95,10 +95,10 @@ pub void CopyIn.write(u8[] data)
 pub void CopyIn.row(any ...args)
 {
     Conn *c = self.conn_();
-    ad String line = str.new();
+    scoped String line = str.new();
     for (i64 i = 0; i < args.len; i++) {
         if (i) { line.appendByte('\t'); }
-        ad String v = str.new();
+        scoped String v = str.new();
         if (!argText(args[i], &v, i)) {
             line.append("\\N");
             continue;
@@ -305,11 +305,11 @@ pub CopyInto<T> Conn.copyInto<T>(u8[] table)
     ci.field = mem.alloc(sizeof(i32) * (t.fields.len + 1));
     ci.oid = mem.alloc(sizeof(u32) * (t.fields.len + 1));
     ci.jsonb = mem.alloc(sizeof(bool) * (t.fields.len + 1));
-    ad String sql = str.from("COPY ");
+    scoped String sql = str.from("COPY ");
     sql.append(table);
     sql.append(" (");
     try {
-        ad Rows r = self.query("SELECT a.attname::text, a.atttypid::int8, t.typtype::text FROM pg_attribute a"
+        scoped Rows r = self.query("SELECT a.attname::text, a.atttypid::int8, t.typtype::text FROM pg_attribute a"
                                " JOIN pg_type t ON t.oid = a.atttypid"
                                " WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped",
                                table);
@@ -412,7 +412,7 @@ pub void CopyInto<T>.put(T x)
         /* text, varchar, json, an enum...: the binary form is the text
          * (jsonb's after a version byte) */
         u8[] b;
-        ad String j = str.new();
+        scoped String j = str.new();
         if (v.type.kind == reflect.Kind.enumType) {
             b = reflect.nameOf(v.type, reflect.getInt(v));
         } else if (!argBytes(v, &b)) {
@@ -460,7 +460,7 @@ pub void CopyInto<T>.abort(u8[] why = "aborted by the client")
     self.release();
 }
 
-/* As abort(), for ad: frees what end() didn't */
+/* As abort(), for scoped: frees what end() didn't */
 pub void CopyInto<T>.free()
 {
     if (!self.in.done) { self.in.abort(); }

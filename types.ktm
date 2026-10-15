@@ -205,7 +205,7 @@ static void arrayText(reflect.Value v, String *out, i64 i)
             arrayText(d, out, i);   /* nested: a multidimensional array */
             continue;
         }
-        ad String s = str.new();
+        scoped String s = str.new();
         if (!argText(e, &s, i)) {
             out.append("NULL");
             continue;
@@ -524,7 +524,7 @@ static void Conn.putArg(u32 oid, reflect.Value v, i64 i)
     i64 ln;
     reflect.Type *le;
     if (arrayElem(oid) && listOf(v, &la, &ln, &le)) {   /* a list to an array parameter */
-        ad String s = str.new();
+        scoped String s = str.new();
         arrayText(v, &s, i);
         self.putText(s);
         return;
@@ -555,7 +555,7 @@ static void Conn.putArg(u32 oid, reflect.Value v, i64 i)
             break;
     }
     if (t.kind == reflect.Kind.structType || t.kind == reflect.Kind.slice || t.kind == reflect.Kind.array) {
-        ad String j = json.encode(v);
+        scoped String j = json.encode(v);
         self.putText(j);
         return;
     }
@@ -597,7 +597,7 @@ static bool argText(reflect.Value v, String *out, i64 i)
             break;
     }
     if (t.kind == reflect.Kind.structType || t.kind == reflect.Kind.slice || t.kind == reflect.Kind.array) {
-        ad String j = json.encode(v);
+        scoped String j = json.encode(v);
         out.append(j);
         return true;
     }

@@ -55,7 +55,7 @@ void column(String *s, u8[] name, i64 oid)
 
 void dataRow(String *out, i64 id, u8[] text, bool nulls)
 {
-    ad String b = str.new();
+    scoped String b = str.new();
     put16(&b, 2);
     if (nulls) {
         put32(&b, -1);
@@ -74,7 +74,7 @@ void dataRow(String *out, i64 id, u8[] text, bool nulls)
 String transcript(i64 kind = 0)
 {
     String out = str.new();
-    ad String b = str.new();
+    scoped String b = str.new();
     if (kind == 1) {
         put32(&b, 5);
         b.append("salt");
@@ -189,7 +189,7 @@ void damage(String *s, u8[] good)
                 u8 *p = s.ptr;
                 i64 len = (i64)p[m + 1] << 24 | (i64)p[m + 2] << 16 | (i64)p[m + 3] << 8 | p[m + 4];
                 if (len < 4 || m + 1 + len > s.len) { break; }
-                ad String dup = str.from(p[m:m + 1 + len]);
+                scoped String dup = str.from(p[m:m + 1 + len]);
                 s.insert(m, dup);
             }
         }
@@ -236,7 +236,7 @@ void round(u8[] url, bool check)
     try {
         c = pg.connect(url);
         for (i64 k = 0; k < 2; k++) {
-            ad pg.Rows r = c.query("SELECT $1::int8, 'x'::text", 1);
+            scoped pg.Rows r = c.query("SELECT $1::int8, 'x'::text", 1);
             i64 n = 0;
             while (r.next()) {
                 n++;
@@ -263,19 +263,19 @@ void round(u8[] url, bool check)
 i32 main()
 {
     t.start("fuzz");
-    ad String good = transcript();
-    ad String md5 = transcript(1);
-    ad String scram = transcript(2);
+    scoped String good = transcript();
+    scoped String md5 = transcript(1);
+    scoped String scram = transcript(2);
     gBlob = str.from(good);
     thread.Pool *tp = thread.poolNew(1);
     thread.poolEnqueue(tp, null, &server);
     date.sleepMs(100);
-    ad String url = str.format("postgres://fuzz:pw@127.0.0.1:%d/db?sslmode=disable&connect_timeout=5", PORT);
+    scoped String url = str.format("postgres://fuzz:pw@127.0.0.1:%d/db?sslmode=disable&connect_timeout=5", PORT);
     round(url, true);
     t.ok(gOk == 1 && gStrange == 0, "the transcript as it is works");
     i64 rounds = 20000;
     i64 start = date.monoMs();
-    ad String bad = str.new();
+    scoped String bad = str.new();
     for (i64 i = 0; i < rounds; i++) {
         if (i % 3 == 0) { damage(&bad, good); }
         else if (i % 3 == 1) { damage(&bad, md5); }

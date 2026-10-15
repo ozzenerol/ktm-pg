@@ -180,7 +180,7 @@ static void Conn.broken(u8 *what)
 {
     i32 err = os.errno();
     if (self.s.impl) {              /* TLS: its reason says more than errno */
-        ad String why = str.from(self.s.impl.error());
+        scoped String why = str.from(self.s.impl.error());
         self.dead = true;
         self.s.close(&self.s);
         self.wakeAll();
@@ -460,7 +460,7 @@ static ServerError serverError(u8[] m)
         else if (f == 'V') { sev = v; }
     }
     if (!e.code) { e.code = ERR_PROTOCOL; }
-    ad String st = stateText(e.code);
+    scoped String st = stateText(e.code);
     if (sev.len && !sev.equals("ERROR")) { e.message.appendFormat("%s: ", sev); }
     e.message.appendFormat("%s (SQLSTATE %s)", text, st);
     if (detail.len) { e.message.appendFormat("; detail: %s", detail); }
@@ -473,7 +473,7 @@ static ServerError Conn.serverErr()
 {
     ServerError e = serverError(self.msg);
     if (self.cancelSent && e.code == QUERY_CANCELED) {
-        ad String pre = str.format("timeout after %d ms: ", self.timeoutMs);
+        scoped String pre = str.format("timeout after %d ms: ", self.timeoutMs);
         e.message.insert(0, pre);
     }
     return e;
@@ -508,7 +508,7 @@ static void Conn.drain()
  * with c.close(). */
 pub Conn *connect(u8[] url = "")
 {
-    ad Config cfg = configParse(url);
+    scoped Config cfg = configParse(url);
     Conn *c = connectConfig(&cfg);
     c.ownCtx = cfg.tlsCtx;          /* the Config goes now; the session keeps its context */
     cfg.tlsCtx = null;
@@ -727,7 +727,7 @@ static void Conn.auth(Config *cfg, Scram *sc)
     }
     if (kind == 12) {                /* SASLFinal: v=<server signature> */
         u8[] v = self.msg[4:];
-        ad String sig = str.new();
+        scoped String sig = str.new();
         if (!str.startsWith(v, "v=") || !base64Decode(v[2:], &sig) || sig.len != 32
             || !hash.equalCt(sig, sc.serverSig[0:32])) {
             throw(ERR_AUTH, "pg: the server's SCRAM signature is wrong: it doesn't know the password");
@@ -756,7 +756,7 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
         /* a hostile server could keep the client hashing for hours */
         throw(ERR_AUTH, "pg: the server asks for %d SCRAM iterations, more than %d", iter, SCRAM_MAX_ITER);
     }
-    ad String salt = str.new();
+    scoped String salt = str.new();
     if (!base64Decode(s, &salt)) { throw(ERR_AUTH, "pg: a bad SCRAM salt"); }
     u8 salted[32], clientKey[32], storedKey[32], sig[32], serverKey[32];
     bool cached = false;
@@ -782,7 +782,7 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
     hash.sha256(clientKey[0:32], storedKey[0:32]);
     /* c=: the GS2 header, and with -PLUS the hash of the server's
      * certificate (tls-server-end-point, RFC 5929) */
-    ad String cbind = str.from(sc.gs2);
+    scoped String cbind = str.from(sc.gs2);
     if (sc.plus) {
         i32 md = 0;
         u8[] der = self.s.impl.peerCert(&md);
@@ -791,15 +791,15 @@ static void Conn.scramFinal(Config *cfg, Scram *sc, u8[] serverFirst)
         i64 hl = certHash(der, md, h);
         cbind.append(h[0:hl]);
     }
-    ad String finalBare = str.from("c=");
+    scoped String finalBare = str.from("c=");
     base64Append(&finalBare, cbind);
     finalBare.appendFormat(",r=%s", r);
-    ad String authMsg = str.format("%s,%s,%s", sc.clientFirstBare, serverFirst, finalBare);
+    scoped String authMsg = str.format("%s,%s,%s", sc.clientFirstBare, serverFirst, finalBare);
     hmacSha256(storedKey[0:32], authMsg, sig[0:32]);
     u8 proof[32];
     for (i64 i = 0; i < 32; i++) { proof[i] = clientKey[i] ^ sig[i]; }
     hmacSha256(serverKey[0:32], authMsg, sc.serverSig[0:32]);
-    ad String msg = str.from(finalBare);
+    scoped String msg = str.from(finalBare);
     msg.append(",p=");
     base64Append(&msg, proof[0:32]);
     self.begin('p');
@@ -1225,7 +1225,7 @@ pub i64 Conn.execScript(u8[] sql)
 }
 
 /* Runs a query; read its rows with rows.next() and free them with
- * rows.free() (or ad). The connection is busy until then. */
+ * rows.free() (or scoped). The connection is busy until then. */
 pub Rows Conn.queryArgs(u8[] sql, reflect.Value[] args)
 {
     Req *req = mem.allocZero(sizeof(Req));

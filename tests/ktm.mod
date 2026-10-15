@@ -1,6 +1,6 @@
 module github.com/ozzenerol/ktm-pg/tests
 
-ktm 0.19
+ktm 0.24
 
 require github.com/ozzenerol/ktm-pg v0.0.0
 

@@ -3,7 +3,7 @@ import mem, reflect;
 
 /* The rows of a query, read one at a time from the connection as they
  * come. The values of a row are views valid until the next call to
- * next(). Free the Rows with rows.free() (or declare them ad): it reads
+ * next(). Free the Rows with rows.free() (or declare them scoped): it reads
  * and drops what is left and gives the connection back. */
 pub struct Rows
 {

@@ -70,7 +70,7 @@ static void arenaFree(Arena *a)
 /* The rows of a query, all of them, as a T each: len and data, so
  *   for (auto u : res) { ... }
  * walks them, and res.at(i) is the i-th. Free it with res.free() (or
- * declare it ad). */
+ * declare it scoped). */
 pub struct Result<T>
 {
     i64 len;
@@ -132,14 +132,14 @@ pub T *Result<T>.at(i64 i)
 }
 
 /* Every row of the query in a Result:
- *   ad pg.Result<User> users = pg.queryResult<User>(db, "SELECT id, name FROM users");
+ *   scoped pg.Result<User> users = pg.queryResult<User>(db, "SELECT id, name FROM users");
  *   for (auto u : users) { printf("%d %s\n", u.id, u.name); }
  * As queryAll, with the rows' text and bytes in one arena: far fewer
  * allocations for a big result. db is a Conn *, a Tx * or a Pool *. */
 pub Result<T> queryResult<T>(Db *db, u8[] sql, any ...args)
 {
     if (!db) { dbNull("queryResult"); }
-    ad Rows r = db.open(db, sql, args, true);
+    scoped Rows r = db.open(db, sql, args, true);
     Result<T> res;
     mem.set(&res, 0, sizeof(Result<T>));
     r.arena = &res.arena;

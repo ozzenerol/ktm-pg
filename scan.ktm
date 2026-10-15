@@ -175,7 +175,7 @@ static void Rows.scanValue(reflect.Value v, i64 i, i64 flags)
     u32 elem = arrayElem(col.oid);
     if (elem && t.kind != reflect.Kind.string && !(t.kind == reflect.Kind.slice && isByte(t.elem))) {
         /* an array into a slice, a fixed array or a vec.Vec: through JSON */
-        ad String j = str.new();
+        scoped String j = str.new();
         reflect.Type *et = listElem(t);
         bool zero = et && et.kind != reflect.Kind.pointer;      /* NULL elements: 0, false, "" */
         if (!arrayToJson(self.text(i), elem, &j, zero)) {
@@ -284,7 +284,7 @@ static void Rows.scanValue(reflect.Value v, i64 i, i64 flags)
 pub vec.Vec<T> queryAll<T>(Db *db, u8[] sql, any ...args)
 {
     if (!db) { dbNull("queryAll"); }
-    ad Rows r = db.open(db, sql, args, true);
+    scoped Rows r = db.open(db, sql, args, true);
     return rowsAll<T>(&r);
 }
 
@@ -315,7 +315,7 @@ static vec.Vec<T> rowsAll<T>(Rows *r)
 pub T queryOne<T>(Db *db, u8[] sql, any ...args)
 {
     if (!db) { dbNull("queryOne"); }
-    ad Rows r = db.open(db, sql, args, true);
+    scoped Rows r = db.open(db, sql, args, true);
     return rowsOne<T>(&r);
 }
 

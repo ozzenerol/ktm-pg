@@ -32,7 +32,7 @@ struct Opt { i64 id; i64 *boss; u8 *note; };
 
 void getters(pg.Conn *c)
 {
-    ad pg.Rows r = c.query("SELECT 1::int2, -2::int4, 9007199254740993::int8, 1.5::float4, 0.1::float8, true, false,"
+    scoped pg.Rows r = c.query("SELECT 1::int2, -2::int4, 9007199254740993::int8, 1.5::float4, 0.1::float8, true, false,"
                            " '\\x00ff10'::bytea, '1999-12-31 23:59:59.999999'::timestamp,"
                            " '1969-07-20 20:17:40+00'::timestamptz, '0001-01-01'::date, 'infinity'::timestamp,"
                            " 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, 123.4500::numeric, 'NaN'::float8, 42::oid");
@@ -80,7 +80,7 @@ void params(pg.Conn *c)
     i64 n = c.exec("INSERT INTO types_t VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                    i2, 2147483647, -9223372036854775807, 0.25, 1e300, true, bin, when, when, when, id, 3, tag, 42);
     t.ok(n == 1, "insert of every type");
-    ad pg.Rows r = c.query("SELECT i2, i4, i8, f4, f8, b, by, ts, tz, d, u, n, j->>'name', tx FROM types_t");
+    scoped pg.Rows r = c.query("SELECT i2, i4, i8, f4, f8, b, by, ts, tz, d, u, n, j->>'name', tx FROM types_t");
     t.ok(r.next(), "read back");
     t.ok(r.int(0) == -7 && r.int(1) == 2147483647 && r.int(2) == -9223372036854775807, "ints back");
     t.ok(r.float(3) == 0.25 && r.float(4) == 1e300 && r.bool(5), "floats and bool back");
@@ -151,14 +151,14 @@ void scanning(pg.Conn *c)
     try { User none = pg.queryOne<User>(c, "SELECT * FROM users_t WHERE id = 99"); } catch (Error e) { code = e.code; }
     t.ok(code == pg.ERR_NO_ROWS, "queryOne with no row");
     t.ok(pg.queryOne<i64>(c, "SELECT count(*) FROM users_t") == 2, "a scalar");
-    ad String nm = pg.queryOne<String>(c, "SELECT name FROM users_t WHERE id = 1");
+    scoped String nm = pg.queryOne<String>(c, "SELECT name FROM users_t WHERE id = 1");
     t.ok(nm.equals("ann"), "a String");
     vec.Vec<i64> ids = pg.queryAll<i64>(c, "SELECT id FROM users_t ORDER BY id DESC");
     t.ok(ids.len == 2 && ids.get(0) == 2, "a Vec of scalars");
     ids.free();
 
     /* strict */
-    ad pg.Rows r = c.query("SELECT id, name, extra FROM users_t WHERE id = 1");
+    scoped pg.Rows r = c.query("SELECT id, name, extra FROM users_t WHERE id = 1");
     r.next();
     User s;
     mem.set(&s, 0, sizeof(User));
@@ -215,7 +215,7 @@ struct Money { i64 cents; String amount; f64 approx; };
 
 void numeric(pg.Conn *c)
 {
-    ad pg.Rows r = c.query("SELECT 9007199254740993::numeric, 99999999999999999.00::numeric, -9223372036854775808::numeric,"
+    scoped pg.Rows r = c.query("SELECT 9007199254740993::numeric, 99999999999999999.00::numeric, -9223372036854775808::numeric,"
                            " 9223372036854775808::numeric, 12.50::numeric, 'NaN'::numeric, 0.10::numeric, '-0'::numeric,"
                            " 12345678901234567890.123456789::numeric");
     t.ok(r.next(), "a row");
@@ -255,7 +255,7 @@ void dates()
 i32 main()
 {
     t.start("types");
-    ad String u = t.url();
+    scoped String u = t.url();
     pg.Conn *c = pg.connect(u);
     getters(c);
     params(c);
