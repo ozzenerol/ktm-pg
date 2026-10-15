@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.0 (unreleased)
+
+- `pg.queryResult<T>(db, sql, ...)`: every row in a `pg.Result<T>` (`len`, `data`, `at(i)`,
+  range-for), the rows' text and bytes in a few large blocks freed together by `res.free()`.
+  About 20% faster than `queryAll` on a 1000-row result.
+- A null pool (`r.app` when `http.listen` got none) throws `ERR_ARG` saying so instead of
+  crashing: `queryOne`, `queryAll` and the `Pool` calls.
+
 ## v0.1.1 (2026-10-14)
 
 - A frozen server (`docker pause`, a hung host) no longer holds `Pool.acquire()`: the health

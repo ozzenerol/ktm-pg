@@ -57,7 +57,7 @@ static void Rows.scanFields(void *dst, reflect.Type *t, i64 flags)
             u8 *at = msg + self.off[i * 2];
             switch (self.fieldOf[i * 2 + 1]) {     /* the common cases, without reflection */
                 case HOW_STRING:
-                    setString(to, at, len);
+                    if (self.arena) { arenaString(self.arena, to, at, len); } else { setString(to, at, len); }
                     continue;
                 case HOW_I64:
                     if (len == 8) { *(i64 *)to = (i64)bytesBe64(at[0:8]); continue; }
@@ -213,12 +213,17 @@ static void Rows.scanValue(reflect.Value v, i64 i, i64 flags)
             return;
         }
         case reflect.Kind.string:
+            if (self.arena) {
+                u8[] s = self.text(i);
+                arenaString(self.arena, v.ptr, s.ptr, s.len);
+                return;
+            }
             *(String *)v.ptr = str.from(self.text(i));
             return;
         case reflect.Kind.slice:
             if (isByte(t.elem)) {
                 u8[] b = self.bytes(i);
-                u8 *p = mem.alloc(b.len + 1);
+                u8 *p = self.arena ? arenaAlloc(self.arena, b.len + 1) : mem.alloc(b.len + 1);
                 mem.copy(p, b.ptr, b.len);
                 p[b.len] = 0;
                 u8[] *s = v.ptr;
@@ -238,15 +243,25 @@ static void Rows.scanValue(reflect.Value v, i64 i, i64 flags)
             if (t.kind == reflect.Kind.pointer) {
                 if (isByte(t.elem)) {
                     u8[] b = self.text(i);
-                    u8 *p = mem.alloc(b.len + 1);
+                    u8 *p = self.arena ? arenaAlloc(self.arena, b.len + 1) : mem.alloc(b.len + 1);
                     mem.copy(p, b.ptr, b.len);
                     p[b.len] = 0;
                     *(u8 **)v.ptr = p;
                     return;
                 }
+                /* what it points to is its own allocation, all of it
+                 * (Result.free frees it with json.free) */
                 void *p = mem.allocZero(t.elem.size);
                 *(void **)v.ptr = p;
-                self.scanValue(reflect.__value(p, t.elem), i, flags);
+                Arena *arena = self.arena;
+                self.arena = null;
+                try {
+                    self.scanValue(reflect.__value(p, t.elem), i, flags);
+                } catch (Error e) {
+                    self.arena = arena;
+                    throw(e);
+                }
+                self.arena = arena;
                 return;
             }
         default:
