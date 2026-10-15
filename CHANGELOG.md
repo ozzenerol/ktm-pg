@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 (unreleased)
+## v0.2.0 (2026-10-15)
 
 - `pg.queryResult<T>(db, sql, ...)`: every row in a `pg.Result<T>` (`len`, `data`, `at(i)`,
   range-for), the rows' text and bytes in a few large blocks freed together by `res.free()`.
