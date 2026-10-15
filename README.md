@@ -10,7 +10,9 @@ import "github.com/ozzenerol/ktm-pg";      // the package is named pg
 ```
 
 - Connect with a URL and the `PG*` environment, like libpq.
-- `exec`, `query`, and `pg.queryAll<T>` / `pg.queryOne<T>` that scan rows into structs.
+- `exec`, `query`, and `pg.queryAll<T>` / `pg.queryOne<T>` that scan rows into structs;
+  `pg.queryResult<T>` for big results, freed at once.
+- `COPY` in and out, and binary `COPY` from structs (`c.copyInto<T>(table)`).
 - Transactions, a pool safe across `coro.serve` / `net.http` threads, query timeouts with
   server-side cancel, automatic pipelining.
 - TLS (`sslmode` like libpq), SCRAM-SHA-256 and SCRAM-SHA-256-PLUS, md5, cleartext,
@@ -143,6 +145,25 @@ struct: Strings, slices, pointed-to values, the same as `json.decode`.
 
 Timestamps are read as UTC: `text()` of a timestamptz ends in `+00`.
 
+### Big results: `queryResult`
+
+`pg.queryResult<T>` reads the same rows as `queryAll`, into a `pg.Result<T>` that keeps the
+rows' text and bytes (their `String`, `u8[]` and `u8 *` fields) in a few large blocks instead
+of a malloc each, and frees them all at once:
+
+```c
+ad pg.Result<User> users = pg.queryResult<User>(db, "SELECT id, name, email FROM users");
+for (auto u : users) { printf("%d %s\n", u.id, u.name); }      // users.len, users.data, users.at(i)
+String keep = users.at(0).name.clone();                          // a copy that outlives users
+```
+
+- Those `String`s and slices are views into the `Result`: read them while it lives, `clone()`
+  what you keep, and don't free or append to them.
+- Other fields that allocate (a pointer, a `vec.Vec`, a `json` column into a struct) are their
+  own allocations, as with `queryAll`; `res.free()` (or `ad`) frees them too.
+- A 1000-row query of three columns is about 20% faster than `queryAll` from end to end
+  (1 malloc per few thousand values instead of one per value).
+
 ### NULL
 
 A NULL becomes 0, `""`, `false` or an empty slice in a value field, so a NULL and a real 0 look
@@ -234,6 +255,27 @@ while (out.next()) { fs.write(f, out.data); }
 `\x...` hex text there. A bad row fails `end()` with the server's error and nothing is copied.
 From a pool, use `db.acquire()`.
 
+### Binary COPY from structs
+
+```c
+pg.CopyInto<Item> in = c.copyInto<Item>("items");    // the columns Item's fields name
+for (auto x : items) { in.put(x); }
+i64 n = in.end();                                    // in.abort() gives up
+```
+
+`copyInto<T>` reads the table's column types once and sends each row in PostgreSQL's binary
+format: nothing to format or parse, about 2.5x faster than `row()` (100,000 rows of five
+columns: 55 ms against 136 ms).
+
+- Fields name columns as when scanning (`@key`, else the name; `@skip` and private fields left
+  out); the other columns get their defaults. A null pointer field is NULL.
+- Column types: the integers, `float4`/`float8`, `bool`, `bytea`, `uuid` (16 bytes), `timestamp`,
+  `timestamptz` and `date` (from `date.Date`), `interval` (`pg.Interval`), `text`, `varchar`,
+  `char`, `name`, `json`, `jsonb` (text, or a struct encoded as JSON) and enums.
+- A field with no column, or a column of another type (`numeric`, arrays, `inet`...), is
+  `ERR_ARG` from `copyInto`; use `copyIn` and `row()` for those tables. A value that can't go in
+  its column (a `String` into an `int8`) is `ERR_ARG` from `put`, before any of the row is sent.
+
 ## LISTEN and NOTIFY
 
 ```c
@@ -292,7 +334,8 @@ Point queries, the bulk of a REST API's work, are faster with about half the cli
 inserts wait for the server's fsync either way. pgx still wins on big results scanned into
 structs: each row's Strings are a malloc and later a free here, while Go's allocator and
 garbage collector make the same allocations cheaper (and its collector runs on the second CPU).
-Reading such results with `rows.text(i)` views, which allocate nothing, avoids that cost.
+Reading such results with `pg.queryResult<T>` (one allocation per block of rows, not per
+value) or `rows.text(i)` views, which allocate nothing, avoids that cost.
 
 ## Errors
 

@@ -8,6 +8,13 @@ pub struct Db
     private fn(Db *, u8[], reflect.Value[], bool) Rows open;   /* bool: the rows are read at once (may share a connection) */
 };
 
+/* A null Db or Pool (the handler's r.app when http.listen got none, a
+ * pg.open that was never called): an error that says so, not a crash */
+void dbNull(u8 *what)
+{
+    throw(ERR_ARG, "pg: %s on a null pool: pg.open(url) makes one (in an http handler, r.app is the app http.listen was given)", what);
+}
+
 /* A connection to the server. One coroutine uses it at a time; share
  * connections through a Pool. */
 pub struct Conn : Db

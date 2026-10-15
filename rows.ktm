@@ -21,6 +21,7 @@ pub struct Rows
     private Req *req;           /* its place in the connection's queue, until the rows end */
     private bool started;       /* its turn came: it reads */
     private u8 *base;           /* the current row's message: off[] counts from here */
+    private Arena *arena;       /* queryResult: text and bytes go here, not one malloc each */
 };
 
 static void Rows.finish()

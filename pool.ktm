@@ -411,6 +411,7 @@ pub Conn *Pool.acquire()
  * connections while it waits */
 static Conn *Pool.take(bool own)
 {
+    if (!self) { dbNull("acquire"); }
     if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
     Shard *s = self.shard();
     s.reap();
@@ -575,6 +576,7 @@ pub void Pool.ping()
  * timeout (a cancel would hit the wrong query) don't share. */
 static Conn *Pool.acquireShared()
 {
+    if (!self) { dbNull("a query"); }
     if (self.queryMs || !coro.inLoop()) { return self.take(false); }
     if (atomic.load(&self.closed)) { throw(ERR_POOL, "pg: the pool is closed"); }
     Shard *s = self.shard();
